@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
@@ -319,8 +320,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     port = int(CFG["PORT"])
-    print(f"胖蓝已开缸：http://localhost:{port}")
-    print(f"模型：{CFG['GEMINI_MODEL']}；记忆文件：{MEMORY_FILE}")
+    print(f"胖蓝已开缸：http://localhost:{port}", flush=True)
+    print(f"模型：{CFG['GEMINI_MODEL']}；记忆文件：{MEMORY_FILE}", flush=True)
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
