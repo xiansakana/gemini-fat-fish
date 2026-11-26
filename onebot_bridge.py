@@ -217,6 +217,13 @@ def cooling(group_id: str, now: float) -> bool:
     return now - last < cooldown_seconds()
 
 
+def clean_for_group(text: str) -> str:
+    """群聊里去掉括号旁白，并丢掉去掉后为空的段落。"""
+    text = re.sub(r"[（(][^）)]{0,40}[）)]", "", text or "")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 def split_reply(text: str, limit: int = 2) -> list[str]:
     text = (text or "").strip()
     if not text:
@@ -339,7 +346,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         log_line(f"{session} | {speaker} | {text} | 调用失败: {error}")
         return {"ok": False, "reason": f"核心调用失败: {error}"}
 
-    parts = split_reply(reply)
+    parts = split_reply(clean_for_group(reply) if group else reply)
     messages = build_segments(parts, group, reply_id, user_id)
 
     for index, segments in enumerate(messages):
