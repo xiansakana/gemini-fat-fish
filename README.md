@@ -24,10 +24,10 @@ python server.py
 ## 关于这次创建的密钥
 
 - 名称：`gemini-fat-fish-local`
-- 所属项目：`test`（项目编号 `gen-lang-client-0464704780`），免费层级
+- 所属项目：`gemini-fat-fish`（由原来的 `test` 改名而来，项目 ID `gen-lang-client-0464704780`，项目编号 `384269412688`），免费层级
 - 密钥已写入本目录 `.env`，并已加入 `.gitignore`
 
-原计划在 Google AI Studio 新建独立项目，但当前 Google 账号已到免费试用项目配额上限（Cloud 控制台提示“已达到免费试用项目配额上限”），AI Studio 也返回 429，所以没有新项目可选。这个密钥放在现有的 `test` 项目里，和其他项目隔离。若之后腾出配额，可以在 AI Studio 里再建独立项目并替换 `.env` 中的值。
+原计划在 Google AI Studio 新建独立项目，但当前 Google 账号已到免费试用项目配额上限（Cloud 控制台提示“已达到免费试用项目配额上限”），AI Studio 也返回 429，所以没有新项目可选。这个密钥放在现有的一个项目里，后来该项目已改名为 `gemini-fat-fish`（项目 ID 未变），与其他项目隔离。改名不影响密钥有效性。
 
 ## 用法
 
