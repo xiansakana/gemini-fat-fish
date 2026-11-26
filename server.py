@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import threading
 import time
 import urllib.error
@@ -22,6 +24,58 @@ STATIC = ROOT / "static"
 ENV_FILE = ROOT / ".env"
 MEMORY_FILE = ROOT / "memory.json"
 PERSONA_FILE = ROOT / "persona.txt"
+TOOL_ROOT = ROOT / "fish_home"
+TOOL_ROOT.mkdir(exist_ok=True)
+
+TOOL_DECLARATIONS = [
+    {
+        "name": "list_files",
+        "description": "列出鱼缸目录里的文件和文件夹。path 为空表示根目录。",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"path": {"type": "STRING", "description": "相对路径"}},
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "读取鱼缸目录里的文本文件。",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"path": {"type": "STRING", "description": "相对路径"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "在鱼缸目录里写入或创建文本文件。",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": {"type": "STRING", "description": "相对路径"},
+                "content": {"type": "STRING", "description": "要写入的内容"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "run_command",
+        "description": "在鱼缸目录里执行一条终端命令，返回输出。不能越出鱼缸。",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"command": {"type": "STRING", "description": "终端命令"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "browse",
+        "description": "打开一个网址并返回页面纯文本，用来查资料。",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"url": {"type": "STRING", "description": "http/https 网址"}},
+            "required": ["url"],
+        },
+    },
+]
 
 DEFAULTS = {
     "GEMINI_API_KEY": "",
@@ -146,12 +200,102 @@ def build_system_instruction(mem: dict) -> str:
     return "\n\n".join(blocks)
 
 
-def call_gemini(mem: dict, message: str) -> tuple[str, dict, str | None]:
+def safe_tool_path(rel: str) -> Path:
+    base = TOOL_ROOT.resolve()
+    candidate = (base / str(rel or ".")).resolve()
+    if not candidate.is_relative_to(base):
+        raise ValueError("只能碰鱼缸里的东西")
+    return candidate
+
+
+def tool_list_files(args: dict) -> str:
+    path = safe_tool_path(args.get("path", "."))
+    if not path.is_dir():
+        return "这不是目录。"
+    entries = sorted(path.iterdir())[:80]
+    if not entries:
+        return "空目录。"
+    return "\n".join(("目录 " if item.is_dir() else "文件 ") + item.name for item in entries)
+
+
+def tool_read_file(args: dict) -> str:
+    path = safe_tool_path(args.get("path", ""))
+    if not path.is_file():
+        return "文件不存在。"
+    return path.read_text(encoding="utf-8", errors="replace")[:10000] or "（空文件）"
+
+
+def tool_write_file(args: dict) -> str:
+    path = safe_tool_path(args.get("path", ""))
+    if path == TOOL_ROOT.resolve():
+        return "不能覆盖鱼缸根目录。"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = str(args.get("content", ""))[:30000]
+    path.write_text(content, encoding="utf-8")
+    return "写好了：" + str(path.relative_to(TOOL_ROOT.resolve()))
+
+
+def tool_run_command(args: dict) -> str:
+    command = str(args.get("command", "")).strip()
+    if not command:
+        return "空命令。"
+    lowered = command.lower()
+    blocked = (
+        "rm -rf", "del /s", "format ", "shutdown", "taskkill", "mkfs",
+        ":(){", ".env", "../", "/d/code/", "d:\\", "c:\\", "~/",
+    )
+    if any(item in lowered for item in blocked):
+        return "这个命令被鱼缸拦住了。"
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=TOOL_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return "命令超时了。"
+    output = (result.stdout + result.stderr).strip()
+    return output[:8000] or "（没有输出）"
+
+
+def tool_browse(args: dict) -> str:
+    url = str(args.get("url", "")).strip()
+    if not url.startswith(("http://", "https://")):
+        return "只认 http/https 网址。"
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 FatFish/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read(40000).decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        return "打不开这个网址：" + type(exc).__name__
+    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", raw, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return url + "\n" + text[:5000]
+
+
+TOOL_DISPATCH = {
+    "list_files": tool_list_files,
+    "read_file": tool_read_file,
+    "write_file": tool_write_file,
+    "run_command": tool_run_command,
+    "browse": tool_browse,
+}
+
+
+def call_gemini(
+    mem: dict, message: str
+) -> tuple[str, dict, str | None, list[dict]]:
     model = CFG["GEMINI_MODEL"]
     version = CFG["GEMINI_API_VERSION"]
-    key = CFG["GEMINI_API_KEY"]
-    if not key:
-        return "还没填 API Key，去 .env 里写 GEMINI_API_KEY。", {}, "缺少 API Key"
+    api_key = CFG["GEMINI_API_KEY"]
+    if not api_key:
+        return "还没填 API Key，去 .env 里写 GEMINI_API_KEY。", {}, "缺少 API Key", []
 
     history = mem.get("history", [])[-int(CFG["RECENT_TURNS"]) * 2:]
     contents = []
@@ -166,47 +310,76 @@ def call_gemini(mem: dict, message: str) -> tuple[str, dict, str | None]:
     if CFG["THINKING_LEVEL"]:
         generation_config["thinkingConfig"] = {"thinkingLevel": CFG["THINKING_LEVEL"]}
 
-    payload = {
-        "system_instruction": {"parts": [{"text": build_system_instruction(mem)}]},
-        "contents": contents,
-        "generationConfig": generation_config,
-    }
     url = (
         f"https://generativelanguage.googleapis.com/{version}/models/"
         f"{model}:generateContent"
     )
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": key,
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            data = json.load(response)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:600]
-        return f"模型调用失败：HTTP {exc.code}。{detail}", {}, f"HTTP {exc.code}"
-    except Exception as exc:  # noqa: BLE001 - 网络错误也要给用户可读反馈
-        return f"网络里游不动了：{type(exc).__name__}", {}, str(exc)
+    events: list[dict] = []
+    usage_total = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-    parts = []
-    for candidate in data.get("candidates", []):
-        for part in candidate.get("content", {}).get("parts", []):
-            if isinstance(part.get("text"), str):
-                parts.append(part["text"])
-    reply = "".join(parts).strip() or "（这条鱼刚刚卡壳了，再说一次？）"
+    for _ in range(6):
+        payload = {
+            "system_instruction": {"parts": [{"text": build_system_instruction(mem)}]},
+            "contents": contents,
+            "generationConfig": generation_config,
+            "tools": [{"functionDeclarations": TOOL_DECLARATIONS}],
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                data = json.load(response)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:600]
+            return f"模型调用失败：HTTP {exc.code}。{detail}", usage_total, f"HTTP {exc.code}", events
+        except Exception as exc:  # noqa: BLE001
+            return f"网络里游不动了：{type(exc).__name__}", usage_total, str(exc), events
 
-    raw_usage = data.get("usageMetadata", {}) or {}
-    usage = {
-        "prompt_tokens": int(raw_usage.get("promptTokenCount", 0) or 0),
-        "output_tokens": int(raw_usage.get("candidatesTokenCount", 0) or 0),
-        "total_tokens": int(raw_usage.get("totalTokenCount", 0) or 0),
-    }
-    return reply, usage, None
+        raw_usage = data.get("usageMetadata", {}) or {}
+        for metric in usage_total:
+            usage_total[metric] += int(raw_usage.get(
+                {"prompt_tokens": "promptTokenCount", "output_tokens": "candidatesTokenCount", "total_tokens": "totalTokenCount"}[metric],
+                0,
+            ) or 0)
+
+        candidates = data.get("candidates") or []
+        parts = (candidates[0].get("content", {}).get("parts", []) if candidates else []) or []
+        texts = [part["text"] for part in parts if isinstance(part.get("text"), str)]
+        calls = [
+            part["functionCall"] for part in parts
+            if isinstance(part.get("functionCall"), dict)
+        ]
+        if not calls:
+            reply = "".join(texts).strip() or "（这条鱼刚刚卡壳了，再说一次？）"
+            return reply, usage_total, None, events
+
+        contents.append({"role": "model", "parts": parts})
+        function_parts = []
+        for call in calls:
+            name = str(call.get("name", ""))
+            args = call.get("args") or {}
+            handler = TOOL_DISPATCH.get(name)
+            if handler is None:
+                result = "不认识这个工具：" + name
+            else:
+                try:
+                    result = str(handler(args))
+                except Exception as exc:  # noqa: BLE001
+                    result = "工具出错：" + type(exc).__name__ + " " + str(exc)[:200]
+            events.append({"name": name, "args": args, "result": result[:400]})
+            function_parts.append(
+                {"functionResponse": {"name": name, "response": {"result": result}}}
+            )
+        contents.append({"role": "user", "parts": function_parts})
+
+    return "（工具绕太多圈了，先停一下）", usage_total, None, events
 
 
 def parse_json_object(text: str) -> dict:
@@ -622,7 +795,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            reply, usage, error = call_gemini(mem, message)
+            reply, usage, error, tool_events = call_gemini(mem, message)
             reply_to_user = reply
             reflection_usage = {}
             now = time.time()
@@ -660,6 +833,7 @@ class Handler(BaseHTTPRequestHandler):
                     "reply": reply_to_user,
                     "usage": usage,
                     "reflection_usage": reflection_usage,
+                    "tool_events": tool_events,
                     "usage_total": mem["usage"],
                     "facts": mem["facts"],
                     "evolve": mem.get("evolve", {}),
