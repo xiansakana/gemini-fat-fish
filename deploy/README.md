@@ -65,6 +65,8 @@ journalctl -u gemini-fish-update.service -n 20 --no-pager
 
 `.env`、`memory.json`、`sessions/` 都在 `.gitignore` 里，`git pull` 不会覆盖。
 
+> 自动更新已于 2026-11-27 在 `private-proxy-us` 上验证：push 后手动触发 timer，服务器拉到新提交并重启了两个服务。
+
 ## 常用命令
 
 ```bash
