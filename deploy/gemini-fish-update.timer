@@ -1,0 +1,11 @@
+[Unit]
+Description=Check git for Gemini Fish updates every 5 minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=gemini-fish-update.service
+
+[Install]
+WantedBy=timers.target

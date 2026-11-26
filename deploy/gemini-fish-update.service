@@ -1,0 +1,7 @@
+[Unit]
+Description=Gemini Fish auto update from git
+
+[Service]
+Type=oneshot
+User=proxyadmin
+ExecStart=/srv/apps/gemini-fat-fish/deploy/update.sh
