@@ -1,4 +1,7 @@
 .env
 memory.json
+sessions/
+logs/
+data/
 __pycache__/
 *.pyc

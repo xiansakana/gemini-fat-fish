@@ -19,6 +19,7 @@
 - 进化默认自动生效（每 3 轮一次），不需要你逐条批准；想回到确认制，把 `.env` 里 `EVOLVE_MODE` 改成 `confirm`。
 - 每隔 `PROACTIVE_MINUTES`（默认 45）没聊天，她会自己发一句短消息过来，页面每 15 秒轮询一次；上一条没被回就不再连发，凌晨也不打扰。
 - 她有工具：`list_files` / `read_file` / `write_file` / `run_command` / `browse`，通过 Gemini function calling 自动调用，页面上会显示她用了什么工具。
+- 可选接入 QQ 群 / 私聊：通过 OneBot v11 桥接，每个群独立记忆、唤醒词、冷却和每日预算，群聊默认禁用本机工具。
 
 ## 运行
 
@@ -80,6 +81,50 @@ Gemini 娘能自己列文件、读写文件、敲终端命令、打开网页查�
 
 她不会去碰桌面、下载、文档、`.env` 或项目里的其他代码。这样她用起来像个会用电脑的真人，但不至于把你的机器翻个底朝天。页面上的工具记录只是给你看她刚才干了什么。
 
+## 接 QQ 群 / 私聊（可选）
+
+网页端不变。QQ 通过 OneBot v11 接入，`onebot_bridge.py` 是独立进程，只用标准库。
+
+```
+QQ ←→ NapCat / LLOneBot（OneBot v11）
+          │ HTTP 上报
+    onebot_bridge.py :8767
+          │ POST /api/chat（session=group_xxx）
+    server.py :8766
+```
+
+### 三步跑起来
+
+1. 启动核心：`python server.py`
+2. 在 `.env` 填 `QQ_BOT_QQ`、`QQ_GROUP_WHITELIST`、`QQ_PRIVATE_WHITELIST`，`QQ_ONEBOT_API` 先留空（干跑模式）
+3. `python onebot_bridge.py`，用 `/simulate` 灌几条消息确认判定；没问题后把 `QQ_ONEBOT_API` 指向 NapCat 的 HTTP API，并在 NapCat 把 HTTP 上报地址设为 `http://127.0.0.1:8767/onebot`
+
+### 群聊规则
+
+| 规则 | 默认行为 |
+| --- | --- |
+| 什么时候回 | 被 @、被回复、文本里有 `小双/Gemini娘/双子`；否则按 5% 概率插话 |
+| 冷却 | 同一个群 25 秒内只回一次 |
+| 白名单 | 留空 = 不响应任何群 / 私聊，必须先填群号 |
+| 拆条 | 最多 2 条；第一条引用原消息并 @ 对方 |
+| 记忆 | 每群 `sessions/group_<群号>.json`，每个私聊 `sessions/private_<QQ号>.json`；网页端仍是 `memory.json` |
+| 权限 | 群聊**没有**文件 / 终端工具，也不注入主人的长期记忆 |
+| 模型 | 群聊固定 `QQ_GROUP_MODEL`（默认 lite），输出上限 260 token，不进化 |
+| 预算 | 每天最多 `QQ_DAILY_CALLS` 次模型调用，超了直接不回 |
+| 主动消息 | 只在网页端，群里不会主动冒泡 |
+
+### 干跑与自测
+
+```bash
+curl http://127.0.0.1:8767/health
+curl -X POST http://127.0.0.1:8767/simulate -H "Content-Type: application/json" \
+  -d '{"message_type":"group","group_id":10000,"user_id":20000,"nickname":"小明","text":"小双在吗"}'
+```
+
+返回里 `dry_run: true` 表示只打印不发送。运行日志在 `logs/qq-YYYY-MM-DD.log`，调用计数在 `data/qq_budget.json`。
+
+> 非官方 QQ 协议有封号风险，**务必用小号**。群聊是陌生人输入，提示词注入风险比私聊高，默认禁工具、禁私密记忆就是为这个。
+
 ## 配置项
 
 都在 `.env` 里：
@@ -97,6 +142,16 @@ Gemini 娘能自己列文件、读写文件、敲终端命令、打开网页查�
 | `EVOLVE_MODE` | `auto` | `auto` 自动生效，`confirm` 需要采纳 |
 | `EVOLVE_OUTPUT_TOKENS` | 320 | 反思输出上限 |
 | `PROACTIVE_MINUTES` | 45 | 多久没聊天后主动发一句 |
+| `QQ_ONEBOT_API` | 空 | OneBot 的 HTTP API 地址；留空为干跑模式 |
+| `QQ_BOT_QQ` | 空 | 机器人自己的 QQ 号，用来识别 @ |
+| `QQ_GROUP_WHITELIST` | 空 | 允许的群号，逗号分隔；空 = 不响应任何群 |
+| `QQ_PRIVATE_WHITELIST` | 空 | 允许的私聊 QQ，逗号分隔；空 = 不响应任何私聊 |
+| `QQ_WAKE_WORDS` | 小双,Gemini娘,双子 | 被叫到这些词就必回 |
+| `QQ_INTERJECT` | 0.05 | 没被叫时的随机插话概率 |
+| `QQ_COOLDOWN` | 25 | 同一个群的回复冷却（秒） |
+| `QQ_GROUP_MODEL` | gemini-3.5-flash-lite | 群聊专用模型 |
+| `QQ_GROUP_MAX_TOKENS` | 260 | 群聊单次输出上限 |
+| `QQ_DAILY_CALLS` | 300 | 每天最多调用多少次模型 |
 
 ## 边界
 
