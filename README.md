@@ -22,6 +22,12 @@ python server.py
 
 浏览器打开 <http://localhost:8766>。无需第三方依赖，Python 3.9+ 即可。密钥只在服务端 `.env`，不会发给浏览器。
 
+如果本机走代理（例如 7890 端口），先设置环境变量再启动：
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890 HTTP_PROXY=http://127.0.0.1:7890
+```
+
 ## 关于密钥
 
 - 名称：`gemini-fat-fish-local`
@@ -71,7 +77,8 @@ python server.py
 
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
-| `GEMINI_MODEL` | `gemini-3.6-flash` | 想更省可改 `gemini-3.5-flash-lite` |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | 主模型；繁忙时可自动切备用 |
+| `GEMINI_FALLBACK_MODEL` | `gemini-3.5-flash-lite` | 主模型 503/限流/超时时自动顶上 |
 | `THINKING_LEVEL` | `low` | 3.x 可用 `minimal` / `low` / `medium` / `high` |
 | `RECENT_TURNS` | 24 | 每次请求带的最近对话轮数 |
 | `HISTORY_KEEP` | 160 | 本地保留的完整对话轮数 |

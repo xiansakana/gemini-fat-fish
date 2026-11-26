@@ -7,7 +7,7 @@ import json
 import urllib.error
 import urllib.request
 
-from server import CFG
+from server import CFG, gemini_post
 
 
 def main() -> None:
@@ -35,27 +35,18 @@ def main() -> None:
         "contents": [{"role": "user", "parts": [{"text": "只回复两个字：收到"}]}],
         "generationConfig": {"maxOutputTokens": 16},
     }
-    url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:generateContent"
-    try:
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=30) as res:
-            data = json.load(res)
-        parts = [
-            part.get("text", "")
-            for candidate in data.get("candidates", [])
-            for part in candidate.get("content", {}).get("parts", [])
-        ]
-        print("模型回复：", "".join(parts).strip()[:100])
-        print("用量：", json.dumps(data.get("usageMetadata", {}), ensure_ascii=False))
-    except urllib.error.HTTPError as exc:
-        print("调用失败：HTTP", exc.code, exc.read().decode("utf-8", errors="replace")[:500])
-    except Exception as exc:  # noqa: BLE001
-        print("调用失败：", type(exc).__name__, exc)
+    data, error = gemini_post(payload, timeout=30)
+    if data is None:
+        print("调用失败：", error)
+        return
+    parts = [
+        part.get("text", "")
+        for candidate in data.get("candidates", [])
+        for part in candidate.get("content", {}).get("parts", [])
+        if isinstance(part.get("text"), str) and not part.get("thought")
+    ]
+    print("模型回复：", "".join(parts).strip()[:100])
+    print("用量：", json.dumps(data.get("usageMetadata", {}), ensure_ascii=False))
 
 
 if __name__ == "__main__":

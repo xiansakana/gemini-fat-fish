@@ -80,6 +80,7 @@ TOOL_DECLARATIONS = [
 DEFAULTS = {
     "GEMINI_API_KEY": "",
     "GEMINI_MODEL": "gemini-3.6-flash",
+    "GEMINI_FALLBACK_MODEL": "gemini-3.5-flash-lite",
     "GEMINI_API_VERSION": "v1beta",
     "PORT": "8766",
     "RECENT_TURNS": "24",
@@ -288,11 +289,49 @@ TOOL_DISPATCH = {
 }
 
 
+def gemini_post(payload: dict, timeout: int = 60) -> tuple[dict | None, str | None]:
+    """先打主模型；遇到限流/繁忙/超时就自动切到备用模型。"""
+    primary = CFG["GEMINI_MODEL"]
+    fallback = str(CFG.get("GEMINI_FALLBACK_MODEL") or "").strip()
+    models = [primary]
+    if fallback and fallback != primary:
+        models.append(fallback)
+    version = CFG["GEMINI_API_VERSION"]
+    last_error = "模型没回应"
+    for index, model in enumerate(models):
+        url = (
+            f"https://generativelanguage.googleapis.com/{version}/models/"
+            f"{model}:generateContent"
+        )
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": CFG["GEMINI_API_KEY"],
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response), None
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            last_error = f"HTTP {exc.code}：{detail}"
+            if exc.code in (408, 429, 500, 502, 503, 504) and index < len(models) - 1:
+                continue
+            return None, last_error
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{type(exc).__name__}：{exc}"
+            if index < len(models) - 1:
+                continue
+            return None, last_error
+    return None, last_error
+
+
 def call_gemini(
     mem: dict, message: str
 ) -> tuple[str, dict, str | None, list[dict]]:
-    model = CFG["GEMINI_MODEL"]
-    version = CFG["GEMINI_API_VERSION"]
     api_key = CFG["GEMINI_API_KEY"]
     if not api_key:
         return "还没填 API Key，去 .env 里写 GEMINI_API_KEY。", {}, "缺少 API Key", []
@@ -310,10 +349,6 @@ def call_gemini(
     if CFG["THINKING_LEVEL"]:
         generation_config["thinkingConfig"] = {"thinkingLevel": CFG["THINKING_LEVEL"]}
 
-    url = (
-        f"https://generativelanguage.googleapis.com/{version}/models/"
-        f"{model}:generateContent"
-    )
     events: list[dict] = []
     usage_total = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -324,23 +359,9 @@ def call_gemini(
             "generationConfig": generation_config,
             "tools": [{"functionDeclarations": TOOL_DECLARATIONS}],
         }
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key,
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                data = json.load(response)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:600]
-            return f"模型调用失败：HTTP {exc.code}。{detail}", usage_total, f"HTTP {exc.code}", events
-        except Exception as exc:  # noqa: BLE001
-            return f"网络里游不动了：{type(exc).__name__}", usage_total, str(exc), events
+        data, error = gemini_post(payload, timeout=60)
+        if data is None:
+            return f"模型调用失败：{error}", usage_total, error, events
 
         raw_usage = data.get("usageMetadata", {}) or {}
         for metric in usage_total:
@@ -351,7 +372,10 @@ def call_gemini(
 
         candidates = data.get("candidates") or []
         parts = (candidates[0].get("content", {}).get("parts", []) if candidates else []) or []
-        texts = [part["text"] for part in parts if isinstance(part.get("text"), str)]
+        texts = [
+            part["text"] for part in parts
+            if isinstance(part.get("text"), str) and not part.get("thought")
+        ]
         calls = [
             part["functionCall"] for part in parts
             if isinstance(part.get("functionCall"), dict)
@@ -424,12 +448,15 @@ def format_proposal(proposal: dict) -> str:
 def apply_proposal(mem: dict, proposal: dict) -> str:
     evolve = mem.setdefault("evolve", empty_memory()["evolve"])
     changes = []
+    added_facts = 0
 
     for item in (proposal.get("facts") or [])[:3]:
         fact = str(item).strip()[:120]
         if fact and fact not in mem["facts"]:
             mem["facts"].append(fact)
-            changes.append("记下一件事")
+            added_facts += 1
+    if added_facts:
+        changes.append(f"记下 {added_facts} 件事")
 
     for name, delta in (proposal.get("traits") or {}).items():
         if name not in evolve.get("traits", {}):
@@ -459,7 +486,7 @@ def apply_proposal(mem: dict, proposal: dict) -> str:
         changes.append("写了日记")
 
     mem["pending"] = None
-    return "采纳了：" + ("、".join(changes) if changes else "它这次什么也没改") + "。"
+    return "、".join(changes) if changes else "什么也没改"
 
 
 def reflect_for_evolution(mem: dict) -> tuple[dict | None, dict, str | None]:
@@ -490,32 +517,15 @@ def reflect_for_evolution(mem: dict) -> tuple[dict | None, dict, str | None]:
         "contents": [{"role": "user", "parts": [{"text": "请输出 JSON 提案。"}]}],
         "generationConfig": {"maxOutputTokens": int(CFG["EVOLVE_OUTPUT_TOKENS"])},
     }
-    url = (
-        f"https://generativelanguage.googleapis.com/{CFG['GEMINI_API_VERSION']}/models/"
-        f"{CFG['GEMINI_MODEL']}:generateContent"
-    )
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": CFG["GEMINI_API_KEY"],
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            data = json.load(response)
-    except urllib.error.HTTPError as exc:
-        return None, {}, f"HTTP {exc.code}"
-    except Exception as exc:  # noqa: BLE001
-        return None, {}, type(exc).__name__
+    data, error = gemini_post(payload, timeout=30)
+    if data is None:
+        return None, {}, error
 
     text = "".join(
         part.get("text", "")
         for candidate in data.get("candidates", [])
         for part in candidate.get("content", {}).get("parts", [])
-        if isinstance(part.get("text"), str)
+        if isinstance(part.get("text"), str) and not part.get("thought")
     )
     raw_usage = data.get("usageMetadata", {}) or {}
     usage = {
@@ -543,32 +553,15 @@ def generate_proactive(mem: dict) -> tuple[str | None, dict, str | None]:
     }
     if CFG["THINKING_LEVEL"]:
         payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": CFG["THINKING_LEVEL"]}
-    url = (
-        f"https://generativelanguage.googleapis.com/{CFG['GEMINI_API_VERSION']}/models/"
-        f"{CFG['GEMINI_MODEL']}:generateContent"
-    )
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": CFG["GEMINI_API_KEY"],
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            data = json.load(response)
-    except urllib.error.HTTPError as exc:
-        return None, {}, f"HTTP {exc.code}"
-    except Exception as exc:  # noqa: BLE001
-        return None, {}, type(exc).__name__
+    data, error = gemini_post(payload, timeout=30)
+    if data is None:
+        return None, {}, error
 
     text = "".join(
         part.get("text", "")
         for candidate in data.get("candidates", [])
         for part in candidate.get("content", {}).get("parts", [])
-        if isinstance(part.get("text"), str)
+        if isinstance(part.get("text"), str) and not part.get("thought")
     ).strip()
     raw_usage = data.get("usageMetadata", {}) or {}
     usage = {
@@ -667,7 +660,7 @@ def handle_local_command(mem: dict, message: str) -> tuple[str, bool] | None:
         pending = mem.get("pending")
         if not pending:
             return "没有可以采纳的提案。", True
-        return apply_proposal(mem, pending), True
+        return "采纳了：" + apply_proposal(mem, pending) + "。"
     if text in ("/否决", "否决", "别进化"):
         if not mem.get("pending"):
             return "本来就没有提案。", True
