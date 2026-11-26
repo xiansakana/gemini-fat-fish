@@ -120,6 +120,8 @@
       <div>模型：<b id="model">-</b></div>
       <div>调用：<b id="calls">0</b> 次　本次输入：<b id="tokens">0</b> token</div>
       <div>累计输入：<b id="totalIn">0</b>　累计输出：<b id="totalOut">0</b></div>
+      <div>状态：<b id="rel">刚认识</b> · <b id="mood">平静</b></div>
+      <div class="chiprow" id="traits"></div>
     </div>
     <div class="chiprow" id="facts"></div>
   </aside>
@@ -133,6 +135,9 @@
       <button data-cmd="/记忆">看记忆</button>
       <button data-cmd="/状态">看用量</button>
       <button data-cmd="/清空">清对话</button>
+      <button data-cmd="/进化">看提案</button>
+      <button data-cmd="/采纳">采纳</button>
+      <button data-cmd="/否决">否决</button>
     </div>
     <div class="composer">
       <textarea id="input" placeholder="跟胖蓝说两句……（Ctrl+Enter 发送）"></textarea>
@@ -172,6 +177,26 @@ function renderFacts(facts) {
   });
 }
 
+function renderEvolve(evolve, pending) {
+  if (!evolve) return;
+  document.getElementById('rel').textContent = evolve.relationship || '刚认识';
+  document.getElementById('mood').textContent = evolve.mood || '平静';
+  const box = document.getElementById('traits');
+  box.innerHTML = '';
+  Object.entries(evolve.traits || {}).forEach(([name, value]) => {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.textContent = name + ' ' + value + '/10';
+    box.append(chip);
+  });
+  if (pending) {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.textContent = '有进化提案待确认';
+    box.append(chip);
+  }
+}
+
 function renderUsage(total, current) {
   if (total) {
     document.getElementById('calls').textContent = total.calls ?? 0;
@@ -204,6 +229,7 @@ async function send(text) {
     addMsg('fish', data.reply || '（没说话）');
     renderUsage(data.usage_total, data.usage);
     renderFacts(data.facts);
+    renderEvolve(data.evolve, data.pending);
     if (data.error) errBox.textContent = '调用异常：' + data.error;
     setTimeout(() => { fish.className = 'fish'; }, 900);
   } catch (e) {
@@ -235,6 +261,7 @@ document.querySelectorAll('.tools button').forEach(btn => {
     document.getElementById('model').textContent = state.model;
     renderUsage(state.usage, null);
     renderFacts(state.facts);
+    renderEvolve(state.evolve, state.pending);
     (state.history || []).forEach(t => addMsg(t.role === 'user' ? 'user' : 'fish', t.text));
     addMsg('fish', '我游过来了。有事说话，没事也能摸鱼。');
   } catch (e) {
