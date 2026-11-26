@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>胖蓝 · Gemini 大肥鱼</title>
+<title>Moffy · Gemini 小伙伴</title>
 <style>
   :root {
     --bg: #0b1220;
@@ -101,20 +101,21 @@
 <body>
 <div class="shell">
   <aside class="card tank">
-    <h1>胖蓝 · 大肥鱼</h1>
-    <div class="sub">Gemini 驱动，省着吃 token</div>
+    <h1>Moffy · 莫菲</h1>
+    <div class="sub">Gemini 的四角星，住在鱼缸里</div>
     <div class="fish-wrap">
       <div class="bubble" style="left:24px;bottom:0;width:12px;height:12px;animation-delay:0s"></div>
       <div class="bubble" style="left:64px;bottom:0;width:8px;height:8px;animation-delay:1.4s"></div>
       <div class="bubble" style="right:38px;bottom:0;width:15px;height:15px;animation-delay:2.8s"></div>
-      <svg class="fish" id="fish" viewBox="0 0 200 130" aria-label="一条蓝色胖鱼">
+      <svg class="fish" id="fish" viewBox="0 0 200 130" aria-label="眼睛里有四角星的蓝色小伙伴">
         <ellipse cx="96" cy="68" rx="70" ry="43" fill="#3a8ede"/>
         <ellipse cx="92" cy="60" rx="62" ry="34" fill="#59b0ff" opacity=".65"/>
         <path d="M158 68 L192 38 Q186 68 192 98 Z" fill="#2d6fd1"/>
         <path d="M92 28 Q112 6 124 30 Z" fill="#2d6fd1"/>
         <path d="M84 106 Q100 124 116 104 Z" fill="#2d6fd1"/>
-        <circle cx="54" cy="58" r="8" fill="#f4fbff"/>
-        <circle cx="52" cy="58" r="4" fill="#12233c"/>
+        <circle cx="54" cy="58" r="9" fill="#f4fbff"/>
+        <path d="M52 51 L54.5 55.5 L59 58 L54.5 60.5 L52 65 L49.5 60.5 L45 58 L49.5 55.5 Z" fill="#7b61ff"/>
+        <circle cx="52" cy="58" r="1.6" fill="#ffffff"/>
         <path d="M30 78 Q44 88 58 77" stroke="#174a80" stroke-width="3" fill="none" stroke-linecap="round"/>
         <ellipse cx="40" cy="70" rx="9" ry="5" fill="#7fc4ff" opacity=".5"/>
         <circle cx="128" cy="48" r="5" fill="#8fd0ff" opacity=".35"/>
@@ -135,7 +136,7 @@
     <div class="head"><strong>鱼塘</strong><span id="headInfo">本地运行 · Key 不进浏览器</span></div>
     <div class="msgs" id="msgs"></div>
     <div class="err" id="err"></div>
-    <div class="typing" id="typing" hidden>胖蓝正在想……</div>
+    <div class="typing" id="typing" hidden>Moffy正在想……</div>
     <div class="tools">
       <button data-cmd="记住：">记住</button>
       <button data-cmd="/记忆">看记忆</button>
@@ -148,7 +149,7 @@
       <button data-cmd="/关系">关系</button>
     </div>
     <div class="composer">
-      <textarea id="input" placeholder="跟胖蓝说两句……（Ctrl+Enter 发送）"></textarea>
+      <textarea id="input" placeholder="跟Moffy说两句……（Ctrl+Enter 发送）"></textarea>
       <button class="send" id="send">投喂</button>
     </div>
   </main>
@@ -167,7 +168,7 @@ function addMsg(role, text) {
   row.className = 'row' + (role === 'user' ? ' me' : '');
   const avatar = document.createElement('div');
   avatar.className = 'avatar';
-  avatar.textContent = role === 'user' ? '我' : '蓝';
+  avatar.textContent = role === 'user' ? '我' : 'M';
   const bubble = document.createElement('div');
   bubble.className = 'bubble-msg';
   bubble.textContent = text;
