@@ -118,6 +118,7 @@
       <div>调用：<b id="calls">0</b> 次　本次输入：<b id="tokens">0</b> token</div>
       <div>累计输入：<b id="totalIn">0</b>　累计输出：<b id="totalOut">0</b></div>
       <div>状态：<b id="rel">刚认识</b> · <b id="mood">平静</b></div>
+      <div>相处：<b id="days">1</b> 天　聊过 <b id="msgCount">0</b> 句　好感 <b id="affection">0</b>/100</div>
       <div class="chiprow" id="traits"></div>
     </div>
     <div class="chiprow" id="facts"></div>
@@ -138,6 +139,8 @@
       <button data-cmd="/否决">否决</button>
       <button data-cmd="/日记">日记</button>
       <button data-cmd="/关系">关系</button>
+      <button data-cmd="/好感">好感</button>
+      <button id="voiceBtn" type="button">语音：关</button>
     </div>
     <div class="composer">
       <textarea id="input" placeholder="跟她说两句……（Ctrl+Enter 发送）"></textarea>
@@ -153,6 +156,65 @@ const errBox = document.getElementById('err');
 const fish = document.getElementById('fish');
 const typing = document.getElementById('typing');
 const seenInbox = new Set();
+
+const MOOD_FACE = {
+  '平静': 'calm', '开心': 'smile', '好奇': 'surprised', '犯困': 'closed_smile',
+  '别扭': 'pout', '兴奋': 'smile', '安静': 'calm', '有点闷': 'sad'
+};
+let currentFace = 'smile';
+function setFace(name) {
+  if (!name || name === currentFace) return;
+  currentFace = name;
+  fish.src = '/expressions/' + name + '.png';
+}
+function faceFor(mood) { return MOOD_FACE[mood] || 'calm'; }
+function faceForReply(reply, mood) {
+  const t = String(reply || '');
+  if (/哼|才不|懒得|别闹|讨厌/.test(t)) return 'pout';
+  if (/哈哈|嘿嘿|笑死|逗你/.test(t)) return 'smile';
+  if (/对不起|抱歉|算了|没意思/.test(t)) return 'sad';
+  if (/真的吗|居然|竟然|！/.test(t)) return 'surprised';
+  if (/晚安|睡吧|困/.test(t)) return 'closed_smile';
+  return faceFor(mood);
+}
+
+const voiceBtn = document.getElementById('voiceBtn');
+let voiceOn = localStorage.getItem('fishVoice') === 'on';
+function paintVoiceBtn() { voiceBtn.textContent = '语音：' + (voiceOn ? '开' : '关'); }
+paintVoiceBtn();
+voiceBtn.onclick = () => {
+  voiceOn = !voiceOn;
+  localStorage.setItem('fishVoice', voiceOn ? 'on' : 'off');
+  paintVoiceBtn();
+  if (!voiceOn && window.speechSynthesis) speechSynthesis.cancel();
+};
+
+fish.style.cursor = 'pointer';
+fish.title = '点一下试试';
+fish.onclick = () => {
+  const pool = ['smile', 'shy', 'pout', 'surprised', 'closed_smile'];
+  setFace(pool[Math.floor(Math.random() * pool.length)]);
+  setTimeout(() => setFace(faceFor(document.getElementById('mood').textContent)), 2600);
+};
+
+function speak(text) {
+  if (!voiceOn || !text || !window.speechSynthesis) return;
+  const clean = String(text)
+    .split('\n\n（')[0]
+    .replace(/[（(][^）)]{0,80}[）)]/g, '')
+    .replace(/[`*_#>]/g, '')
+    .trim();
+  if (!clean) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(clean.slice(0, 200));
+  const voices = speechSynthesis.getVoices().filter(v => /zh|Chinese/i.test(v.lang + ' ' + v.name));
+  const pick = voices.find(v => /Xiaoxiao|Yaoyao|Ting|女|Female/i.test(v.name)) || voices[0];
+  if (pick) u.voice = pick;
+  u.lang = 'zh-CN';
+  u.rate = 1.04;
+  u.pitch = 1.12;
+  speechSynthesis.speak(u);
+}
 
 function addMsg(role, text) {
   const row = document.createElement('div');
@@ -209,10 +271,23 @@ function renderEvolve(evolve, pending) {
   }
 }
 
+function renderStats(state) {
+  const s = state.stats || {};
+  document.getElementById('days').textContent = state.days ?? 1;
+  document.getElementById('msgCount').textContent = s.messages ?? 0;
+  document.getElementById('affection').textContent = s.affection ?? 0;
+}
+
 async function renderInbox(items) {
   if (!items || !items.length) return;
   const fresh = items.filter(item => !seenInbox.has(item.id));
-  fresh.forEach(item => { seenInbox.add(item.id); addMsg('fish', item.text); });
+  fresh.forEach(item => {
+    seenInbox.add(item.id);
+    addMsg('fish', item.text);
+    setFace('surprised');
+    speak(item.text);
+    setTimeout(() => setFace(faceFor(document.getElementById('mood').textContent)), 5000);
+  });
   await api('/api/inbox/seen', {ids: items.map(item => item.id)});
 }
 
@@ -221,6 +296,7 @@ async function pollState() {
     const res = await fetch('/api/state');
     const state = await res.json();
     renderEvolve(state.evolve, state.pending);
+    renderStats(state);
     renderInbox(state.inbox);
     document.getElementById('headInfo').textContent =
       (state.evolve_mode === 'auto' ? '自动进化' : '确认进化') + ' · Key 不进浏览器';
@@ -253,20 +329,25 @@ async function send(text) {
   errBox.textContent = '';
   addMsg('user', message);
   fish.className = 'fish thinking';
+  setFace('serious');
   typing.hidden = false;
   try {
     const data = await api('/api/chat', {message});
     fish.className = 'fish talking';
     renderToolEvents(data.tool_events);
     addMsg('fish', data.reply || '（没说话）');
+    setFace(faceForReply(data.reply, (data.evolve || {}).mood));
+    speak(data.reply);
     renderUsage(data.usage_total, data.usage);
     renderFacts(data.facts);
     renderEvolve(data.evolve, data.pending);
     if (data.error) errBox.textContent = '调用异常：' + data.error;
     typing.hidden = true;
+    pollState();
     setTimeout(() => { fish.className = 'fish'; }, 900);
   } catch (e) {
     fish.className = 'fish';
+    setFace('sad');
     typing.hidden = true;
     errBox.textContent = '连不上本地服务：' + e.message;
   }
@@ -277,6 +358,7 @@ input.addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
 });
 document.querySelectorAll('.tools button').forEach(btn => {
+  if (btn.id === 'voiceBtn') return;
   btn.onclick = () => {
     const cmd = btn.dataset.cmd;
     if (cmd === '记住：') {
@@ -296,6 +378,8 @@ document.querySelectorAll('.tools button').forEach(btn => {
     renderUsage(state.usage, null);
     renderFacts(state.facts);
     renderEvolve(state.evolve, state.pending);
+    renderStats(state);
+    setFace(faceFor((state.evolve || {}).mood));
     renderInbox(state.inbox);
     document.getElementById('headInfo').textContent =
       (state.evolve_mode === 'auto' ? '自动进化' : '确认进化') + ' · Key 不进浏览器';

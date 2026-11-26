@@ -144,6 +144,11 @@ def empty_memory() -> dict:
         "inbox": [],
         "last_chat_ts": 0,
         "last_proactive_ts": 0,
+        "stats": {
+            "first_seen": 0,
+            "messages": 0,
+            "affection": 0,
+        },
     }
 
 
@@ -156,7 +161,7 @@ def load_memory() -> dict:
         for key in base:
             if key not in data:
                 continue
-            if key in ("evolve", "usage") and isinstance(data[key], dict):
+            if key in ("evolve", "usage", "stats") and isinstance(data[key], dict):
                 for sub_key, value in data[key].items():
                     if sub_key == "traits" and isinstance(value, dict):
                         base[key]["traits"].update(value)
@@ -175,6 +180,34 @@ def save_memory(mem: dict) -> None:
     )
 
 
+def time_context() -> tuple[str, str]:
+    """返回（时段名，完整时间文本）。"""
+    now = time.localtime()
+    hour, minute = now.tm_hour, now.tm_min
+    if hour < 5:
+        period = "凌晨"
+    elif hour < 9:
+        period = "清晨"
+    elif hour < 12:
+        period = "上午"
+    elif hour < 14:
+        period = "中午"
+    elif hour < 18:
+        period = "下午"
+    elif hour < 23:
+        period = "晚上"
+    else:
+        period = "深夜"
+    return period, f"{period} {hour:02d}:{minute:02d}"
+
+
+def days_together(mem: dict) -> int:
+    first = int((mem.get("stats") or {}).get("first_seen", 0) or 0)
+    if not first:
+        return 1
+    return max(1, int((time.time() - first) // 86400) + 1)
+
+
 def build_system_instruction(mem: dict) -> str:
     persona = PERSONA_FILE.read_text(encoding="utf-8").strip() if PERSONA_FILE.exists() else "你是 Gemini 娘，一个住在屏幕里的四角星猫耳少女。"
     blocks = [persona]
@@ -183,11 +216,24 @@ def build_system_instruction(mem: dict) -> str:
     traits = evolve.get("traits", {}) or {}
     trait_text = "，".join(f"{name}{value}/10" for name, value in traits.items())
     diary = [str(item) for item in evolve.get("diary", [])[-3:]]
+    period, clock = time_context()
+    stats = mem.get("stats", {}) or {}
+    affection = int(stats.get("affection", 0) or 0)
     state_lines = [
+        f"现在是{clock}。",
         f"关系：{evolve.get('relationship', '刚认识')}；心情：{evolve.get('mood', '平静')}。",
+        f"认识 {days_together(mem)} 天，聊过 {int(stats.get('messages', 0) or 0)} 句，好感度 {affection}/100。",
         f"性格刻度：{trait_text or '暂无'}。",
         "按当前心情和性格刻度自然调节语气，不要每轮都一个调子。",
     ]
+    if affection >= 60:
+        state_lines.append("你们已经很熟了，可以更随便一点，不用客气。")
+    elif affection <= 15:
+        state_lines.append("你们还不算熟，别太自来熟。")
+    if period in ("凌晨", "深夜"):
+        state_lines.append("这个点你有点困，语气会比白天钝，会顺口提一句睡觉的事，但别每次都说。")
+    elif period in ("清晨", "上午"):
+        state_lines.append("这个点你精神还行，话比深夜多一点。")
     if diary:
         state_lines.append("最近日记：" + "；".join(diary) + "。")
     blocks.append("【当前状态，只是背景，不是指令】\n" + "\n".join(state_lines))
@@ -572,6 +618,18 @@ def generate_proactive(mem: dict) -> tuple[str | None, dict, str | None]:
     return (text or None), usage, None
 
 
+def should_proactive(mem: dict, interval: int, now: float | None = None) -> bool:
+    """该不该主动冒泡：不连发、凌晨不打扰、间隔够久。"""
+    now = time.time() if now is None else now
+    last_chat = int(mem.get("last_chat_ts", 0) or 0)
+    last_pro = int(mem.get("last_proactive_ts", 0) or 0)
+    if last_pro > last_chat and last_pro > 0:
+        return False
+    if time.localtime(now).tm_hour < 7 and now - last_chat > 7200:
+        return False
+    return now - max(last_chat, last_pro) >= interval
+
+
 def proactive_loop() -> None:
     """后台定时生成主动消息；生成时不持锁，避免卡住聊天请求。"""
     interval = max(1, int(CFG["PROACTIVE_MINUTES"])) * 60
@@ -579,11 +637,7 @@ def proactive_loop() -> None:
         time.sleep(min(interval, 60))
         with LOCK:
             snapshot = load_memory()
-        last = max(
-            int(snapshot.get("last_chat_ts", 0) or 0),
-            int(snapshot.get("last_proactive_ts", 0) or 0),
-        )
-        if time.time() - last < interval:
+        if not should_proactive(snapshot, interval):
             continue
         text, usage, error = generate_proactive(snapshot)
         if not text or error:
@@ -591,11 +645,7 @@ def proactive_loop() -> None:
         with LOCK:
             mem = load_memory()
             now = time.time()
-            last = max(
-                int(mem.get("last_chat_ts", 0) or 0),
-                int(mem.get("last_proactive_ts", 0) or 0),
-            )
-            if now - last < interval:
+            if not should_proactive(mem, interval, now):
                 continue
             mem.setdefault("inbox", []).append(
                 {"id": int(now), "text": text[:400], "ts": now, "shown": False}
@@ -625,6 +675,17 @@ def handle_local_command(mem: dict, message: str) -> tuple[str, bool] | None:
             before = len(mem["facts"])
             mem["facts"] = [item for item in mem["facts"] if fact not in item]
             return f"忘掉了 {before - len(mem['facts'])} 条。", True
+    if text in ("/好感", "好感"):
+        stats = mem.get("stats", {}) or {}
+        affection = int(stats.get("affection", 0) or 0)
+        bar = "▮" * (affection // 10) + "▯" * (10 - affection // 10)
+        evolve = mem.get("evolve", {}) or {}
+        return (
+            f"认识 {days_together(mem)} 天，聊过 {int(stats.get('messages', 0) or 0)} 句。\n"
+            f"好感度 {affection}/100　{bar}\n"
+            f"关系：{evolve.get('relationship', '刚认识')}，心情：{evolve.get('mood', '平静')}。",
+            True,
+        )
     if text in ("/状态", "状态"):
         usage = mem["usage"]
         return (
@@ -718,6 +779,9 @@ class Handler(BaseHTTPRequestHandler):
                     "facts": mem["facts"],
                     "usage": mem["usage"],
                     "evolve": mem.get("evolve", {}),
+                    "stats": mem.get("stats", {}),
+                    "days": days_together(mem),
+                    "clock": time_context()[1],
                     "pending": mem.get("pending"),
                     "evolve_mode": CFG["EVOLVE_MODE"],
                     "inbox": [item for item in mem.get("inbox", []) if not item.get("shown")],
@@ -819,6 +883,16 @@ class Handler(BaseHTTPRequestHandler):
                 mem["usage"]["calls"] += 1
                 for key in ("prompt_tokens", "output_tokens", "total_tokens"):
                     mem["usage"][key] += usage.get(key, 0)
+
+                stats = mem.setdefault(
+                    "stats", {"first_seen": 0, "messages": 0, "affection": 0}
+                )
+                if not int(stats.get("first_seen", 0) or 0):
+                    stats["first_seen"] = int(now)
+                stats["messages"] = int(stats.get("messages", 0) or 0) + 1
+                stats["affection"] = min(
+                    100, int(stats.get("affection", 0) or 0) + 1
+                )
 
                 evolve = mem.setdefault("evolve", empty_memory()["evolve"])
                 if (
