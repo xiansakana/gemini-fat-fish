@@ -830,8 +830,6 @@ def on_bot_joined(group_id: str) -> None:
     if int(result.get("fetched") or 0) >= 5:
         log_line(f"[进群] {group_id} | 群里有历史，先潜水")
         return
-    if random.random() > max(0.0, notice_rate()):
-        return
     reply = ask_event("你刚被拉进一个还没人说话的新群", intro_context(group_id))
     if not reply:
         return
