@@ -417,7 +417,7 @@ def dynamic_threshold(group_id: str) -> int:
     value = get_talk_value(group_id)
     if value:
         base = base / value
-    return max(3, min(9, int(round(base))))
+    return max(_int_cfg("QQ_THRESHOLD_MIN", 3, 1, 9), min(9, int(round(base))))
 
 
 def profile_key(group_id: str, user_id) -> str:
@@ -1079,7 +1079,8 @@ def clean_for_group(text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def split_reply(text: str, limit: int = 2) -> list[str]:
+def split_reply(text: str, limit: int = 0) -> list[str]:
+    limit = limit or _int_cfg("QQ_SPLIT_PARTS", 2, 1, 4)
     text = (text or "").strip()
     if not text:
         return []
@@ -1610,7 +1611,7 @@ def evaluate_group(
             if now - float(_group_last_observe.get(group_id + ":eval", 0.0)) < observe_interval():
                 return {"ok": False, "spoke": False, "reason": "评估间隔未到"}
             speakers = {item.get("speaker") for item in pending}
-            if len(speakers) < 2:
+            if len(speakers) < _int_cfg("QQ_OBSERVE_MIN_SPEAKERS", 2, 1, 5):
                 return {"ok": False, "spoke": False, "reason": "只有一个人说话"}
             if not observe_budget_ok():
                 return {"ok": False, "spoke": False, "reason": "观察预算用完"}

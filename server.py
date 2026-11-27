@@ -154,6 +154,8 @@ DEFAULTS = {
     "QQ_VISION_VIDEO_SECONDS": "45",
     # 群聊里的只读联网工具（搜索 / 网页 / B站），文件与终端工具不开放
     "QQ_GROUP_WEB": "1",
+    # 追加给她的说话风格提示（留空=不追加），用来切话痨/安静模式
+    "QQ_CHATTY_HINT": "",
     # 自己刷 B 站：定时挑一条，写进记忆
     "SURF_ENABLED": "1",
     "SURF_INTERVAL_MINUTES": "180",
@@ -478,6 +480,9 @@ def build_system_instruction(
             "要结合上面的内容理解它真正想问什么，接着回答，不要当成无意义的刷屏。"
         )
 
+    chatty_hint = str(CFG.get("QQ_CHATTY_HINT") or "").strip()
+    if chatty_hint:
+        blocks.append("【说话风格，优先于上面的语气描述】\n" + chatty_hint[:500])
     if channel == "group":
         blocks.append(
             "【你现在在 QQ 群里】\n"
