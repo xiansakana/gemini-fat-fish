@@ -1516,7 +1516,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         profile_context = (profile_context + "\n" + slang).strip()
     persona = group_persona(group_id) if group else ""
     group_context = build_group_context(group_id) if group else ""
-    media = collect_media(attachments) if group and vision_enabled() else []
+    media = collect_media(attachments) if vision_enabled() else []
     if media:
         log_line(f"[媒体] {group_id} | 图 {sum(1 for m in media if m['type'] == 'image')} "
                  f"视频 {sum(1 for m in media if m['type'] == 'video')}")
