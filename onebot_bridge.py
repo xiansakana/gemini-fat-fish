@@ -1126,19 +1126,21 @@ def clean_for_group(text: str) -> str:
 
 def _split_fragments(text: str, soft: int = 26, hard: int = 48) -> list[str]:
     """按句子和逗号切成口语碎块，再合并到 soft 字左右。"""
-    text = re.sub(r"\s+", " ", text.strip())
+    text = text.strip()
     if not text:
         return []
-    raw = [piece.strip() for piece in re.split(r"(?<=[。！？!?…])", text) if piece.strip()]
     pieces: list[str] = []
-    for piece in raw:
-        if len(piece) <= soft:
-            pieces.append(piece)
-            continue
-        for sub in re.split(r"(?<=[，,、；;])", piece):
-            sub = sub.strip()
-            if sub:
-                pieces.append(sub)
+    # 换行是模型主动分的条，必须保留
+    for line in [item.strip() for item in text.splitlines() if item.strip()]:
+        raw = [piece.strip() for piece in re.split(r"(?<=[。！？!?…])", line) if piece.strip()]
+        for piece in raw:
+            if len(piece) <= soft:
+                pieces.append(piece)
+                continue
+            for sub in re.split(r"(?<=[，,、；;])", piece):
+                sub = sub.strip()
+                if sub:
+                    pieces.append(sub)
     merged: list[str] = []
     current = ""
     for piece in pieces:
