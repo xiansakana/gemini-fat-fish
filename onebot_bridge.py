@@ -52,6 +52,7 @@ _group_recent_replies: dict[str, list[str]] = {}
 _group_talk_value: dict[str, float] = {}
 _group_summary_counter: dict[str, int] = {}
 _group_slang_counter: dict[str, int] = {}
+_group_last_notice: dict[str, float] = {}
 _group_buffer: dict[str, list[dict]] = {}
 _group_cursor: dict[str, int] = {}
 _group_seq: dict[str, int] = {}
@@ -150,6 +151,14 @@ def observe_cooldown() -> float:
 
 def sticker_rate() -> float:
     return _float_cfg("QQ_STICKER_RATE", 0.08, 0.0, 1.0)
+
+
+def notice_rate() -> float:
+    return _float_cfg("QQ_NOTICE_RATE", 0.5, 0.0, 1.0)
+
+
+def notice_gap() -> float:
+    return _float_cfg("QQ_NOTICE_GAP", 60, 10, 3600)
 
 
 def context_probe_enabled() -> bool:
@@ -280,18 +289,19 @@ def _bigrams(text: str) -> set[str]:
     return {value[i:i + 2] for i in range(len(value) - 1)}
 
 
+def _similar(a: str, b: str) -> bool:
+    left, right = _bigrams(a), _bigrams(b)
+    if not left or not right:
+        return False
+    union = left | right
+    return len(left & right) / len(union) >= 0.62
+
+
 def is_duplicate(group_id: str, text: str) -> bool:
     current = _bigrams(text)
     if not current:
         return False
-    for previous in (_group_recent_replies.get(group_id) or [])[-8:]:
-        old = _bigrams(previous)
-        if not old:
-            continue
-        union = current | old
-        if union and len(current & old) / len(union) >= 0.62:
-            return True
-    return False
+    return any(_similar(text, previous) for previous in (_group_recent_replies.get(group_id) or [])[-8:])
 
 
 def remember_bot_said(group_id: str, text: str) -> None:
@@ -367,7 +377,21 @@ def update_profile(group_id: str, user_id, speaker: str, text: str, ts: float) -
     alias = re.search(r"叫我(.{1,12})", text)
     if alias:
         entry["alias"] = alias.group(1).strip("，。！？ ")
-    facts = [str(x) for x in (entry.get("facts") or [])]
+    facts = []
+    for item in (entry.get("facts") or []):
+        if isinstance(item, dict):
+            facts.append(item)
+        elif str(item).strip():
+            facts.append({"text": str(item), "ts": ts, "weight": 1.0})
+    decayed = []
+    for fact in facts:
+        age_days = max(0.0, (ts - float(fact.get("ts", ts) or ts)) / 86400)
+        weight = float(fact.get("weight", 1.0) or 1.0) * (0.9 ** (age_days / 7))
+        if age_days > 30 and weight < 0.4:
+            continue
+        fact["weight"] = round(weight, 3)
+        decayed.append(fact)
+    facts = decayed
 
     if entry["messages"] - int(entry.get("since_extract", 0)) >= 15:
         mine = [
@@ -378,12 +402,17 @@ def update_profile(group_id: str, user_id, speaker: str, text: str, ts: float) -
         if mine:
             extracted = ask_profile(mine)
             for fact in extracted:
-                if fact and fact not in facts:
-                    facts.append(fact)
-            del facts[:-15]
-            log_line(f"[画像] {group_id} | {speaker} | 新增 {len(extracted)} 条")
+                match = next((f for f in facts if _similar(str(f.get("text")), fact)), None)
+                if match:
+                    match["ts"] = ts
+                    match["weight"] = min(5.0, float(match.get("weight", 1.0)) + 0.5)
+                else:
+                    facts.append({"text": fact, "ts": ts, "weight": 1.0})
+            log_line(f"[画像] {group_id} | {speaker} | 抽取 {len(extracted)} 条")
         entry["since_extract"] = entry["messages"]
 
+    facts.sort(key=lambda item: float(item.get("weight", 0)), reverse=True)
+    del facts[:-15]
     entry["facts"] = facts
     data[key] = entry
     save_json(PROFILE_FILE, data)
@@ -403,7 +432,10 @@ def build_profile_context(group_id: str) -> str:
         for key, entry in data.items():
             if not key.startswith(f"group_{group_id}:") or entry.get("nickname") != name:
                 continue
-            facts = [str(x) for x in (entry.get("facts") or [])][:3]
+            facts = [
+                str(x.get("text") if isinstance(x, dict) else x)
+                for x in (entry.get("facts") or [])
+            ][:3]
             alias = entry.get("alias")
             label = f"{name}（聊过 {entry.get('messages', 0)} 次" + (f"，想被叫 {alias}" if alias else "") + "）"
             if facts:
@@ -809,6 +841,66 @@ def send_group_parts(group_id: str, parts: list[str], reply_id: str | None = Non
     return True
 
 
+def ask_event(event_text: str, context: str) -> str:
+    payload = json.dumps(
+        {"event": event_text, "context": context}, ensure_ascii=False
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        core_url() + "/api/event",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.load(response)
+        return str(data.get("reply") or "")
+    except Exception as exc:  # noqa: BLE001
+        log_line(f"群事件回应失败 {type(exc).__name__} {exc}")
+        return ""
+
+
+def handle_notice(event: dict) -> dict:
+    """撤回 / 入群 / 退群这类群事件，偶尔让她自然接一句。"""
+    group_id = str(event.get("group_id", ""))
+    if group_id not in group_whitelist():
+        return {"ok": False, "reason": "群不在白名单"}
+    notice_type = event.get("notice_type")
+    if notice_type not in ("group_recall", "group_member_join", "group_member_leave"):
+        return {"ok": False, "reason": "无关通知"}
+    user_id = event.get("user_id") or event.get("operator_id")
+    if str(user_id) == cfg("QQ_BOT_QQ"):
+        return {"ok": False, "reason": "自己的事件"}
+
+    now = time.time()
+    if now - float(_group_last_notice.get(group_id, 0.0)) < notice_gap():
+        return {"ok": False, "reason": "群事件冷却中"}
+    if random.random() >= notice_rate():
+        return {"ok": False, "reason": "这次不理"}
+    _group_last_notice[group_id] = now
+
+    who = str(user_id or "有人")
+    texts = {
+        "group_recall": f"{who}撤回了一条消息",
+        "group_member_join": f"{who}进了群",
+        "group_member_leave": f"{who}退了群",
+    }
+    event_text = texts[notice_type]
+    reply = ask_event(event_text, build_group_context(group_id))
+    if not reply or is_duplicate(group_id, reply):
+        return {"ok": False, "reason": "没什么好说的"}
+    parts = split_reply(clean_for_group(reply))
+    if not parts:
+        return {"ok": False, "reason": "空回复"}
+    ok = send_group_parts(group_id, parts)
+    remember_bot_said(group_id, reply)
+    log_line(f"[群事件] {group_id} | {event_text} | {reply[:120]}")
+    return {
+        "ok": True, "reason": "群事件回应", "reply": reply,
+        "parts": parts, "sent": ok,
+    }
+
+
 def handle_group_command(group_id: str, user_id, text: str) -> dict | None:
     """群内运维指令：只有管理员能改发言频率。"""
     if str(user_id) not in admin_qq():
@@ -835,6 +927,48 @@ def handle_group_command(group_id: str, user_id, text: str) -> dict | None:
         else:
             return None
         save_json(PERSONA_FILE, data)
+    elif text.startswith("/忘掉"):
+        keyword = text[3:].strip()
+        if not keyword:
+            return None
+        data = load_json(PROFILE_FILE, {})
+        removed = 0
+        for key, entry in data.items():
+            if not key.startswith(f"group_{group_id}:"):
+                continue
+            kept = []
+            for fact in (entry.get("facts") or []):
+                value = str(fact.get("text") if isinstance(fact, dict) else fact)
+                if keyword in value:
+                    removed += 1
+                else:
+                    kept.append(fact)
+            entry["facts"] = kept
+        save_json(PROFILE_FILE, data)
+        reply = f"行，忘掉了 {removed} 条。"
+    elif text.startswith("/记住"):
+        body = text[3:].strip()
+        if "：" not in body and ":" not in body:
+            return None
+        separator = "：" if "：" in body else ":"
+        nickname, fact = body.split(separator, 1)
+        nickname, fact = nickname.strip()[:20], fact.strip()[:80]
+        if not nickname or not fact:
+            return None
+        data = load_json(PROFILE_FILE, {})
+        target = None
+        for key, entry in data.items():
+            if key.startswith(f"group_{group_id}:") and entry.get("nickname") == nickname:
+                target = entry
+                break
+        if target is None:
+            target = {"nickname": nickname, "facts": [], "messages": 0, "since_extract": 0}
+            data[profile_key(group_id, f"manual:{nickname}")] = target
+        current = target.setdefault("facts", [])
+        if not any(_similar(str(f.get("text") if isinstance(f, dict) else f), fact) for f in current):
+            current.append({"text": fact, "ts": time.time(), "weight": 1.5})
+        save_json(PROFILE_FILE, data)
+        reply = f"记住了：{nickname} —— {fact}"
     else:
         return None
     send_group_parts(group_id, [reply])
@@ -851,6 +985,8 @@ def handle_group_command(group_id: str, user_id, text: str) -> dict | None:
 
 def handle_event(event: dict, simulated: bool = False) -> dict:
     """返回处理结果，便于模拟器直接看到判定过程。"""
+    if event.get("post_type") == "notice":
+        return handle_notice(event)
     if event.get("post_type") not in (None, "message"):
         return {"ok": False, "reason": "非消息事件"}
 
