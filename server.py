@@ -418,6 +418,19 @@ def surf_loop() -> None:
             print(f"[刷B站] 异常 {type(exc).__name__} {exc}", flush=True)
 
 
+SEARCH_INTENT_RE = re.compile(
+    r"(帮我|给我|麻烦|帮忙)?(查一?下|查查|搜一?下|搜搜)"
+    r"|(?:行情|大盘|收盘|开盘|消息面|新闻|热搜|汇率|股价|实时价格|评分|票房|天气|比分|赛果)"
+    r"|(?:最新|今天|现在|此刻).{0,6}(?:多少|怎么样|如何|什么情况|有啥|有什么)"
+)
+
+
+def search_requested(message: str) -> bool:
+    """这条消息是不是在明确要求查实时信息。"""
+    text = str(message or "")
+    return bool(text) and bool(SEARCH_INTENT_RE.search(text))
+
+
 def build_system_instruction(
     mem: dict, channel: str = "web", speaker: str = "",
     profile: str = "", persona_override: str = "", context: str = "",
@@ -892,6 +905,8 @@ def call_gemini(
     if CFG["THINKING_LEVEL"] and not group:
         generation_config["thinkingConfig"] = {"thinkingLevel": CFG["THINKING_LEVEL"]}
 
+    force_search = group and search_requested(message)
+
     events: list[dict] = []
     usage_total = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -901,7 +916,12 @@ def call_gemini(
                 "parts": [{
                     "text": build_system_instruction(
                         mem, channel, speaker, profile, persona_override, context, style
-                    )
+                    ) + (
+                        "\n\n【本轮硬性任务，优先级最高】这条消息明确要求查实时信息。"
+                        "第一轮必须调用 web_search 工具，拿到真实结果后再回答；"
+                        "禁止编造行情、禁止用“懒得查”“自己看”之类的话推脱。"
+                    ) if force_search else ""
+
                 }]
             },
             "contents": contents,
