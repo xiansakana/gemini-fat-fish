@@ -1,0 +1,17 @@
+[Unit]
+Description=Gemini Fish log viewer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=proxyadmin
+WorkingDirectory=/srv/apps/gemini-fat-fish
+Environment=PYTHONUNBUFFERED=1
+Environment=FISH_ROOT=/srv/apps/gemini-fat-fish
+ExecStart=/usr/bin/python3 /srv/apps/gemini-fat-fish/deploy/logview.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -7,8 +7,27 @@
   └─ git push ──────────────► /srv/apps/gemini-fat-fish
                                    ├─ gemini-fish.service      server.py  :8766
                                    ├─ gemini-fish-qq.service   onebot_bridge.py :8767
+                                   ├─ gemini-fish-logview.service deploy/logview.py :8770
                                    └─ gemini-fish-update.timer 每 5 分钟拉一次 git
 ```
+
+## 后台日志页
+
+`deploy/logview.py` 是一个只读日志页，覆盖群消息、桥 stdout/stderr、核心 journal、NapCat 容器日志、自动更新日志，外加一个「运行状态」标签看服务、容器和桥的 health。
+
+```bash
+sudo cp deploy/gemini-fish-logview.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now gemini-fish-logview
+```
+
+`.env` 里必须设置 `LOGVIEW_TOKEN`（`openssl rand -hex 12`），否则服务拒绝启动。访问地址：
+
+```
+http://<服务器IP>:8770/?token=<LOGVIEW_TOKEN>
+```
+
+带 `?token=` 打开一次会写入 HttpOnly Cookie，之后直接访问 `http://<服务器IP>:8770/` 即可。页面不提供任何写操作，也不读 `.env`、会话和记忆文件；换 token 后旧链接立即失效。
 
 服务器直连 Gemini API，不需要代理。网页端只监听 `127.0.0.1:8766`，要从本地访问可以走 SSH 隧道：
 
