@@ -34,6 +34,7 @@ LOG_DIR = ROOT / "logs"
 DATA_DIR = ROOT / "data"
 BUDGET_FILE = DATA_DIR / "qq_budget.json"
 BOT_MESSAGES_FILE = DATA_DIR / "qq_bot_messages.json"
+TALK_VALUE_FILE = DATA_DIR / "qq_talk_value.json"
 
 CORE_TIMEOUT = 90
 _reply_lock = threading.Lock()
@@ -43,6 +44,8 @@ _group_last_reply: dict[str, float] = {}
 _group_last_observe: dict[str, float] = {}
 _group_last_probe: dict[str, float] = {}
 _group_last_bot_text: dict[str, str] = {}
+_group_recent_replies: dict[str, list[str]] = {}
+_group_talk_value: dict[str, float] = {}
 _group_buffer: dict[str, list[dict]] = {}
 _group_cursor: dict[str, int] = {}
 _group_seq: dict[str, int] = {}
@@ -65,6 +68,10 @@ def group_whitelist() -> set[str]:
 
 def private_whitelist() -> set[str]:
     return set(parse_list("QQ_PRIVATE_WHITELIST"))
+
+
+def admin_qq() -> set[str]:
+    return set(parse_list("QQ_ADMIN_QQ"))
 
 
 def wake_words() -> list[str]:
@@ -252,6 +259,73 @@ def mark_consumed(group_id: str) -> None:
         _group_cursor[group_id] = int(buffer[-1]["seq"])
 
 
+def _norm_text(text: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text or "")).lower()
+
+
+def _bigrams(text: str) -> set[str]:
+    value = _norm_text(text)
+    if len(value) < 2:
+        return {value} if value else set()
+    return {value[i:i + 2] for i in range(len(value) - 1)}
+
+
+def is_duplicate(group_id: str, text: str) -> bool:
+    current = _bigrams(text)
+    if not current:
+        return False
+    for previous in (_group_recent_replies.get(group_id) or [])[-8:]:
+        old = _bigrams(previous)
+        if not old:
+            continue
+        union = current | old
+        if union and len(current & old) / len(union) >= 0.62:
+            return True
+    return False
+
+
+def remember_bot_said(group_id: str, text: str) -> None:
+    if not text or not group_id:
+        return
+    bucket = _group_recent_replies.setdefault(group_id, [])
+    bucket.append(str(text)[:300])
+    del bucket[:-10]
+
+
+def get_talk_value(group_id: str) -> float:
+    if group_id not in _group_talk_value:
+        data = load_json(TALK_VALUE_FILE, {})
+        try:
+            _group_talk_value[group_id] = float(data.get(group_id, 1.0))
+        except (TypeError, ValueError):
+            _group_talk_value[group_id] = 1.0
+    return _group_talk_value[group_id]
+
+
+def set_talk_value(group_id: str, value: float) -> None:
+    _group_talk_value[group_id] = max(0.2, min(3.0, float(value)))
+    data = load_json(TALK_VALUE_FILE, {})
+    data[group_id] = _group_talk_value[group_id]
+    save_json(TALK_VALUE_FILE, data)
+
+
+def dynamic_threshold(group_id: str) -> int:
+    """按最近群活跃度和 /quiet /chatty 调整发言门槛。"""
+    base = observe_threshold()
+    now = time.time()
+    recent = [item for item in _group_buffer.get(group_id, [])
+              if now - float(item.get("ts", 0)) < 600]
+    rate = len(recent) / 10.0  # 每分钟消息数
+    if rate >= 8:
+        base += 1
+    elif rate <= 1.5:
+        base -= 1
+    value = get_talk_value(group_id)
+    if value:
+        base = base / value
+    return max(3, min(9, int(round(base))))
+
+
 def ask_observe(messages: list[dict], probe: str = "") -> dict:
     payload = json.dumps({"messages": messages, "probe": probe}, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
@@ -316,6 +390,9 @@ def probe_context(group_id: str, speaker: str, text: str) -> dict | None:
 
 def send_contextual_reply(group_id: str, user_id, decision: dict) -> dict:
     reply = str(decision.get("reply") or "")
+    if is_duplicate(group_id, reply):
+        log_line(f"[上下文去重] {group_id} | {reply[:60]}")
+        return {"ok": False, "reason": "重复回复已跳过"}
     parts = split_reply(clean_for_group(reply))
     if not parts:
         return {"ok": False, "reason": "上下文回复为空"}
@@ -323,6 +400,7 @@ def send_contextual_reply(group_id: str, user_id, decision: dict) -> dict:
     now = time.time()
     _group_last_reply[group_id] = now
     _group_last_bot_text[group_id] = "\n".join(parts)
+    remember_bot_said(group_id, reply)
     mark_consumed(group_id)
     log_line(
         f"[上下文回复] {group_id} | 激活度 {decision.get('activation')} | "
@@ -541,6 +619,34 @@ def send_group_parts(group_id: str, parts: list[str], reply_id: str | None = Non
     return True
 
 
+def handle_group_command(group_id: str, user_id, text: str) -> dict | None:
+    """群内运维指令：只有管理员能改发言频率。"""
+    if str(user_id) not in admin_qq():
+        return None
+    text = (text or "").strip()
+    if text.startswith("/quiet"):
+        set_talk_value(group_id, 0.4)
+        reply = "好，我安静点。"
+    elif text.startswith("/chatty"):
+        set_talk_value(group_id, 2.0)
+        reply = "行，那我多说两句。"
+    elif text.startswith("/normal"):
+        set_talk_value(group_id, 1.0)
+        reply = "恢复平常。"
+    else:
+        return None
+    send_group_parts(group_id, [reply])
+    log_line(f"[指令] {group_id} | {user_id} | {text} | {reply}")
+    return {
+        "ok": True,
+        "reason": "群内指令",
+        "session": f"group_{group_id}",
+        "reply": reply,
+        "parts": [reply],
+        "command": text,
+    }
+
+
 def handle_event(event: dict, simulated: bool = False) -> dict:
     """返回处理结果，便于模拟器直接看到判定过程。"""
     if event.get("post_type") not in (None, "message"):
@@ -561,6 +667,9 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     user_id = event.get("user_id")
     speaker = display_name(event)
     if group:
+        command = handle_group_command(group_id, user_id, text)
+        if command is not None:
+            return command
         log_line(
             f"[入站] {group_id} | {display_name(event)} | {text[:60]} | "
             f"at={at_self} reply={reply_id}"
@@ -609,6 +718,14 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         log_line(f"{session} | {speaker} | {text} | 调用失败: {error}")
         return {"ok": False, "reason": f"核心调用失败: {error}"}
 
+    if group and is_duplicate(group_id, reply):
+        log_line(f"[去重] {group_id} | 原回复太像：{reply[:60]}")
+        retry_prompt = prompt + "\n（刚才你说过很相近的话，这次换个说法，别重复。）"
+        with _reply_lock:
+            retry, retry_error = ask_core(retry_prompt, session, channel, speaker)
+        if retry and not retry_error:
+            reply = retry
+
     parts = split_reply(clean_for_group(reply) if group else reply)
     if group:
         ok = send_group_parts(group_id, parts, reply_id, user_id)
@@ -633,6 +750,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     if group:
         _group_last_reply[group_id] = time.time()
         _group_last_bot_text[group_id] = "\n".join(parts)
+        remember_bot_said(group_id, reply)
         # 她刚开口，之前攒的上下文别再拿来触发一次主动发言
         mark_consumed(group_id)
     log_line(f"{session} | {speaker} | {text} | {reply[:200]}")
@@ -699,9 +817,15 @@ def evaluate_group(
         "reason": reason,
         "messages": len(window),
     }
-    threshold = observe_threshold()
+    threshold = dynamic_threshold(group_id)
+    result["threshold"] = threshold
     if decision.get("speak") and activation >= threshold and decision.get("reply"):
-        parts = split_reply(clean_for_group(str(decision["reply"])))
+        candidate = str(decision["reply"])
+        if is_duplicate(group_id, candidate):
+            log_line(f"group_{group_id} | 主动发言去重 | {candidate[:60]}")
+            log_line(f"group_{group_id} | 观察后沉默 | 激活度 {activation}/10 | 重复回复")
+            return result
+        parts = split_reply(clean_for_group(candidate))
         if parts:
             ok = send_group_parts(group_id, parts)
             result["spoke"] = True
@@ -712,6 +836,7 @@ def evaluate_group(
                 _group_last_observe[group_id] = now
                 _group_last_reply[group_id] = now
                 _group_last_bot_text[group_id] = "\n".join(parts)
+            remember_bot_said(group_id, candidate)
             log_line(
                 f"group_{group_id} | 主动发言 | 激活度 {activation}/10 | "
                 f"{reason} | {str(decision['reply'])[:120]}"
@@ -787,6 +912,9 @@ class Handler(BaseHTTPRequestHandler):
                     "observe_min_messages": observe_min_messages(),
                     "observe_daily_calls": observe_daily_calls(),
                     "context_probe": context_probe_enabled(),
+                    "talk_value": {gid: get_talk_value(gid) for gid in sorted(group_whitelist())},
+                    "threshold": {gid: dynamic_threshold(gid) for gid in sorted(group_whitelist())},
+                    "admin": sorted(admin_qq()),
                     "dry": is_dry(),
                 }
             )
@@ -800,6 +928,9 @@ class Handler(BaseHTTPRequestHandler):
                             "unseen": len(pending_messages(gid)),
                             "last_reply": int(_group_last_reply.get(gid, 0)),
                             "last_speak": int(_group_last_observe.get(gid, 0)),
+                            "talk_value": get_talk_value(gid),
+                            "threshold": dynamic_threshold(gid),
+                            "recent_replies": len(_group_recent_replies.get(gid, [])),
                         }
                         for gid in sorted(group_whitelist())
                     }

@@ -95,6 +95,8 @@ DEFAULTS = {
     "PROACTIVE_MINUTES": "45",
     # 被 @ / 叫名字 / 被回复时的最短间隔，比普通插话短得多
     "QQ_DIRECT_COOLDOWN": "5",
+    # 群内 /quiet /chatty /normal 与 /人设 的管理员 QQ
+    "QQ_ADMIN_QQ": "",
     # 上下文追问：没 @ 但明显接着她的话问时，也算叫她
     "QQ_CONTEXT_PROBE": "1",
     "QQ_CONTEXT_PROBE_WINDOW": "180",
