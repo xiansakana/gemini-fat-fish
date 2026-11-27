@@ -915,6 +915,13 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         return {"ok": False, "reason": "今日预算用完"}
 
     prompt = f"{speaker}：{text}" if group else text
+    if group and len(text) <= 6:
+        earlier = build_group_context(group_id)
+        if earlier:
+            prompt = (
+                f"【群里刚说过，下面这句是在接这些话】\n{earlier}\n\n"
+                f"{speaker}（接着上面的话）：{text}"
+            )
     profile_context = build_profile_context(group_id) if group else ""
     slang = slang_context(group_id) if group else ""
     if slang:
