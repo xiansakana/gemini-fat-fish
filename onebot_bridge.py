@@ -1124,53 +1124,49 @@ def clean_for_group(text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def _split_fragments(text: str, soft: int = 26, hard: int = 48) -> list[str]:
-    """按句子和逗号切成口语碎块，再合并到 soft 字左右。"""
-    text = text.strip()
+def _split_fragments(text: str, soft: int = 26) -> list[str]:
+    """换行是模型主动分的条，原样保留；一行太长才按标点拆开再合并到 soft 字左右。"""
+    text = (text or "").strip()
     if not text:
         return []
-    pieces: list[str] = []
-    # 换行是模型主动分的条，必须保留
+    parts: list[str] = []
     for line in [item.strip() for item in text.splitlines() if item.strip()]:
-        raw = [piece.strip() for piece in re.split(r"(?<=[。！？!?…])", line) if piece.strip()]
-        for piece in raw:
-            if len(piece) <= soft:
-                pieces.append(piece)
-                continue
-            for sub in re.split(r"(?<=[，,、；;])", piece):
-                sub = sub.strip()
-                if sub:
-                    pieces.append(sub)
-    merged: list[str] = []
-    current = ""
-    for piece in pieces:
-        if not current:
-            current = piece
-        elif len(current) + len(piece) <= soft:
-            current += piece
-        else:
-            merged.append(current)
-            current = piece
-    if current:
-        merged.append(current)
-    return [piece for piece in merged if piece]
+        if len(line) <= soft:
+            parts.append(line)
+            continue
+        line = line.replace("……", "…")
+        pieces = [
+            item.strip() for item in re.split(r"(?<=[。！？!?，,、；;…])", line) if item.strip()
+        ]
+        current = ""
+        for piece in pieces:
+            if not current:
+                current = piece
+            elif len(current) + len(piece) <= soft:
+                current += piece
+            else:
+                parts.append(current)
+                current = piece
+        if current:
+            parts.append(current)
+    return parts
 
 
 def split_reply(text: str, limit: int = 0) -> list[str]:
-    """像真人一样一条条发：短句为主，偶尔才合成一条。"""
-    limit = limit or _int_cfg("QQ_SPLIT_PARTS", 2, 1, 4)
+    """像真人一样一条条发：保留模型自己分的行，太多条才合并尾部。"""
+    limit = limit or _int_cfg("QQ_SPLIT_PARTS", 3, 1, 5)
     text = (text or "").strip()
     if not text:
         return []
     parts = _split_fragments(text)
     if not parts:
         return []
-    while len(parts) > limit:
-        index = min(range(len(parts) - 1), key=lambda i: len(parts[i]) + len(parts[i + 1]))
-        parts[index:index + 2] = [parts[index] + parts[index + 1]]
+    if len(parts) > limit:
+        extra = " ".join(parts[limit - 1:])
+        parts = parts[: limit - 1] + [extra]
     parts = [re.sub(r"[，,、；;：:]+$", "", part).strip() for part in parts]
     parts = [part for part in parts if part]
-    if len(parts) > 1 and len(text) <= 40 and random.random() < 0.25:
+    if len(parts) > 1 and "\n" not in text and len(text) <= 20:
         parts = ["".join(parts)]
     return [part[:200] for part in parts]
 
