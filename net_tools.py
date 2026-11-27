@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import gzip
 import html as html_lib
 import ipaddress
 import json
@@ -15,6 +16,7 @@ import socket
 import subprocess
 import threading
 import urllib.parse
+import zlib
 import urllib.request
 
 UA = (
@@ -63,8 +65,30 @@ def _http_get(url: str, timeout: int = 15) -> bytes:
         return response.read(MAX_BYTES)
 
 
+def _decode(raw: bytes) -> str:
+    """有的站点无视 identity 仍然压 gzip，还有的是 GBK，这里统一兜住。"""
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(raw)
+        except OSError:
+            pass
+    elif raw[:2] == b"\x78\x9c" or raw[:2] == b"\x78\x01":
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            pass
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if text.count("\ufffd") < max(1, len(text) // 100):
+            return text
+    return raw.decode("utf-8", "replace")
+
+
 def _json_get(url: str, timeout: int = 15) -> dict:
-    return json.loads(_http_get(url, timeout).decode("utf-8", "replace"))
+    return json.loads(_decode(_http_get(url, timeout)))
 
 
 def strip_html(raw: str) -> str:
@@ -87,25 +111,48 @@ def search_web(query: str, limit: int = 5) -> str:
     )
     if not _safe_url(url):
         return "这个搜索地址不通。"
+    items = _search_bing(query, url, limit)
+    if not items:
+        items = _search_ddg(query, limit)
+    if not items:
+        return f"没搜到「{query}」的结果。"
+    return f"搜索「{query}」的结果：\n" + "\n".join(items)
+
+
+def _search_bing(query: str, url: str, limit: int) -> list[str]:
     try:
-        page = _http_get(url).decode("utf-8", "replace")
-    except Exception as exc:  # noqa: BLE001
-        return f"搜索失败：{type(exc).__name__}"
-    items = []
-    for block in re.findall(r'<li class="b_algo".*?</li>', page, flags=re.S)[:limit]:
+        page = _decode(_http_get(url))
+    except Exception:  # noqa: BLE001
+        return []
+    items: list[str] = []
+    for block in re.findall(r'<li class="b_algo".*?</li>', page, flags=re.S)[:limit * 2]:
         link = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, flags=re.S)
         if not link:
             continue
         title = strip_html(link.group(2))[:120]
         href = html_lib.unescape(link.group(1))
         snippet = re.search(r"<p[^>]*>(.*?)</p>", block, flags=re.S)
-        summary = strip_html(snippet.group(1))[:220] if snippet else ""
+        summary = strip_html(snippet.group(1))[:220].replace("阅读更多", "").strip()
         items.append(f"{len(items) + 1}. {title}\n   {href}\n   {summary}")
         if len(items) >= limit:
             break
-    if not items:
-        return f"没搜到「{query}」的结果。"
-    return f"搜索「{query}」的结果：\n" + "\n".join(items)
+    return items
+
+
+def _search_ddg(query: str, limit: int) -> list[str]:
+    """Bing 解析不到时的备用源。"""
+    url = "https://lite.duckduckgo.com/lite/?" + urllib.parse.urlencode({"q": query})
+    try:
+        page = _decode(_http_get(url))
+    except Exception:  # noqa: BLE001
+        return []
+    titles = re.findall(r"class=.result-link.[^>]*>(.*?)</a>", page, flags=re.S)
+    links = re.findall(r"class=.result-link.[^>]*href=\"([^\"]+)\"", page, flags=re.S)
+    items: list[str] = []
+    for index, title in enumerate(titles[:limit]):
+        href = html_lib.unescape(links[index]) if index < len(links) else ""
+        items.append(f"{index + 1}. {strip_html(title)[:120]}\n   {href}")
+    return items
 
 
 def render_url(url: str, timeout: int = 40) -> str:
@@ -143,11 +190,12 @@ def open_url(url: str, render: bool = False, max_chars: int = 5000) -> str:
     text = ""
     if not render:
         try:
-            raw = _http_get(url).decode("utf-8", "replace")
+            raw = _decode(_http_get(url))
             text = strip_html(raw)
         except Exception:  # noqa: BLE001
             text = ""
-        if len(text) < 400:
+        garbled = text.count("\ufffd") > max(3, len(text) // 200)
+        if len(text) < 400 or garbled:
             render = True
     if render:
         dom = render_url(url)
