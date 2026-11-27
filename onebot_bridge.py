@@ -920,7 +920,8 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         if earlier:
             prompt = (
                 f"【群里刚说过，下面这句是在接这些话】\n{earlier}\n\n"
-                f"{speaker}（接着上面的话）：{text}"
+                f"{speaker}（接着上面的话）：{text}\n"
+                "（请回答上面那句还没被回应的话，不要只评价这句短消息。）"
             )
     profile_context = build_profile_context(group_id) if group else ""
     slang = slang_context(group_id) if group else ""
