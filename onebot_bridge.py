@@ -220,6 +220,13 @@ def join_greet_enabled() -> bool:
     return cfg("QQ_JOIN_GREET", "1").lower() not in ("0", "false", "no", "off")
 
 
+def chatty_mode() -> bool:
+    """话痨模式：聊天和观察评估都放开。"""
+    if cfg("QQ_CHATTY", "0").lower() in ("1", "true", "yes", "on"):
+        return True
+    return bool(cfg("QQ_CHATTY_HINT"))
+
+
 def vision_enabled() -> bool:
     """被直接叫到时，把图片 / 视频也一起送进模型。"""
     return cfg("QQ_VISION", "1").lower() not in ("0", "false", "no", "off")
@@ -874,7 +881,8 @@ def on_bot_joined(group_id: str) -> None:
 
 def ask_observe(messages: list[dict], probe: str = "", intro: str = "") -> dict:
     payload = json.dumps(
-        {"messages": messages, "probe": probe, "intro": intro}, ensure_ascii=False
+        {"messages": messages, "probe": probe, "intro": intro,
+         "chatty": chatty_mode()}, ensure_ascii=False
     ).encode("utf-8")
     request = urllib.request.Request(
         core_url() + "/api/observe",
@@ -1639,7 +1647,9 @@ def evaluate_group(
     }
     threshold = dynamic_threshold(group_id)
     result["threshold"] = threshold
-    if decision.get("speak") and activation >= threshold and decision.get("reply"):
+    if activation >= threshold and decision.get("reply") and (
+        decision.get("speak") or chatty_mode()
+    ):
         candidate = str(decision["reply"])
         if is_duplicate(group_id, candidate):
             log_line(f"group_{group_id} | 主动发言去重 | {candidate[:60]}")

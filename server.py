@@ -928,7 +928,7 @@ def parse_json_object(text: str) -> dict:
     return value
 
 
-def observe_group(messages: list[dict], probe: str = "", intro: str = "") -> tuple[dict, dict]:
+def observe_group(messages: list[dict], probe: str = "", intro: str = "", chatty: bool = False) -> tuple[dict, dict]:
     """看一段群聊，判断 Gemini 娘该不该自然接一句。
 
     probe 是刚收到的最新消息：额外判断它是不是在跟她说话（即使没 @）。
@@ -965,11 +965,16 @@ def observe_group(messages: list[dict], probe: str = "", intro: str = "") -> tup
         lines.append(f"【最新消息，要重点判断】{probe_text}")
     intro_text = str(intro or "").strip()[:800]
     intro_block = f"群的基本情况（只是背景）：\n{intro_text}\n\n" if intro_text else ""
+    chatty_block = (
+        "你现在的设定是群里的话痨：几乎什么话题都想接一句，只要不是吵架、刷屏、纯表情，"
+        "就尽量参与，activation 给 5 以上并给出 reply。\n\n"
+    ) if chatty else ""
     system_text = (
         "你在判断一个 QQ 群里的人现在该不该自然接一句话。"
         "你扮演的是 Gemini 娘：四角星猫耳少女，说话短、懒散、带点吐槽，"
         "像真人群友一样潜水，只在话题真的适合时才开口。\n\n"
         f"现在是{clock}。"
+        + chatty_block
         + intro_block
         + "群聊记录（从旧到新）：\n" + "\n".join(lines) + "\n\n"
         "先判断 addressed：最新那条消息虽然没 @ 她、没叫名字、也没点回复，"
@@ -1586,7 +1591,8 @@ class Handler(BaseHTTPRequestHandler):
             ]
             probe = str(body.get("probe") or "").strip()[:300]
             intro = str(body.get("intro") or "").strip()[:800]
-            result, usage = observe_group(messages, probe, intro)
+            chatty = bool(body.get("chatty"))
+            result, usage = observe_group(messages, probe, intro, chatty)
             self._json({**result, "usage": usage})
             return
         if path == "/api/profile":
