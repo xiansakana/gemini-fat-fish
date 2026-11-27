@@ -83,6 +83,11 @@ def cooldown_seconds() -> int:
         return 25
 
 
+def direct_cooldown_seconds() -> float:
+    """被 @ / 叫名字 / 被回复时的最短间隔，比普通插话短得多。"""
+    return _float_cfg("QQ_DIRECT_COOLDOWN", 5, 0, 60)
+
+
 def daily_calls() -> int:
     try:
         return max(0, int(cfg("QQ_DAILY_CALLS", "300")))
@@ -486,8 +491,16 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     speaker = display_name(event)
 
     now = time.time()
-    if group and cooling(group_id, now):
-        return {"ok": False, "reason": "冷却中"}
+    if group:
+        direct = reason in ("被@", "回复了她", "叫了名字", "私聊白名单")
+        limit = direct_cooldown_seconds() if direct else cooldown_seconds()
+        elapsed = now - float(_group_last_reply.get(group_id, 0.0))
+        if elapsed < limit:
+            if direct:
+                # 被直接叫到时不吞消息，等完很短的间隔再回
+                time.sleep(min(limit - elapsed, 10))
+            else:
+                return {"ok": False, "reason": "冷却中"}
     if group and event.get("message_id") is not None:
         reply_id = str(event.get("message_id"))
 

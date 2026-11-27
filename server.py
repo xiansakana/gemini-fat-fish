@@ -93,6 +93,8 @@ DEFAULTS = {
     "EVOLVE_MODE": "auto",
     "EVOLVE_OUTPUT_TOKENS": "320",
     "PROACTIVE_MINUTES": "45",
+    # 被 @ / 叫名字 / 被回复时的最短间隔，比普通插话短得多
+    "QQ_DIRECT_COOLDOWN": "5",
     # 群聊观察：不被叫时，先读懂上下文再决定要不要开口
     "QQ_OBSERVE_ENABLED": "1",
     "QQ_OBSERVE_MODEL": "gemini-3.5-flash-lite",
