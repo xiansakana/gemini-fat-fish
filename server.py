@@ -899,7 +899,14 @@ def call_gemini(
         print(f"[媒体] {media_note} | 片段 {len(media_parts)}", flush=True)
         contents.append({"role": "user", "parts": user_parts})
     else:
-        contents.append({"role": "user", "parts": [{"text": message}]})
+        parts_ = [{"text": message}]
+        if force_search:
+            parts_.append({"text": (
+                "（系统指令，最高优先级：这条消息明确要求查实时信息。"
+                "先调用 web_search 工具拿真实结果，再用你的口吻回答；"
+                "禁止编造行情，禁止用“懒得查”“自己看”推脱。）"
+            )})
+        contents.append({"role": "user", "parts": parts_})
 
     generation_config = {"maxOutputTokens": max_tokens}
     if CFG["THINKING_LEVEL"] and not group:
@@ -910,17 +917,14 @@ def call_gemini(
     events: list[dict] = []
     usage_total = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
+    searched = False
     for _ in range(3 if group else 6):
         payload = {
             "system_instruction": {
                 "parts": [{
                     "text": build_system_instruction(
                         mem, channel, speaker, profile, persona_override, context, style
-                    ) + (
-                        "\n\n【本轮硬性任务，优先级最高】这条消息明确要求查实时信息。"
-                        "第一轮必须调用 web_search 工具，拿到真实结果后再回答；"
-                        "禁止编造行情、禁止用“懒得查”“自己看”之类的话推脱。"
-                    ) if force_search else ""
+                    )
 
                 }]
             },
@@ -968,7 +972,14 @@ def call_gemini(
             handler = TOOL_DISPATCH.get(name)
             if handler is None:
                 result = "不认识这个工具：" + name
+            elif name == "web_search" and searched:
+                result = (
+                    "这一轮已经搜过一次了，不要再调用任何工具。"
+                    "直接根据上面已拿到的搜索结果，用你自己的口吻回答对方。"
+                )
             else:
+                if name == "web_search":
+                    searched = True
                 try:
                     result = str(handler(args))
                 except Exception as exc:  # noqa: BLE001
