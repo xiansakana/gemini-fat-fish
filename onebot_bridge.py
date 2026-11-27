@@ -489,6 +489,18 @@ def slang_context(group_id: str) -> str:
     return "【群里黑话】" + "、".join(str(x) for x in terms[:5]) if terms else ""
 
 
+def build_group_context(group_id: str) -> str:
+    """把没进会话历史的群聊带进本次回复，避免「6」这种短消息看不懂。"""
+    history = list(_group_buffer.get(group_id, [])[-9:-1])
+    lines = [
+        f"{item.get('speaker', '')}：{item.get('text', '')}" for item in history
+    ]
+    last_bot = _group_last_bot_text.get(group_id, "")
+    if last_bot:
+        lines.append(f"我：{last_bot[:200]}")
+    return "\n".join(lines)
+
+
 def ask_observe(messages: list[dict], probe: str = "") -> dict:
     payload = json.dumps({"messages": messages, "probe": probe}, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
@@ -699,13 +711,13 @@ def split_reply(text: str, limit: int = 2) -> list[str]:
 
 def ask_core(
     text: str, session: str, channel: str, speaker: str,
-    profile: str = "", persona_override: str = "",
+    profile: str = "", persona_override: str = "", context: str = "",
 ) -> tuple[str, str | None]:
     payload = json.dumps(
         {
             "message": text, "session": session, "channel": channel,
             "speaker": speaker, "profile": profile,
-            "persona_override": persona_override,
+            "persona_override": persona_override, "context": context,
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -908,9 +920,11 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     if slang:
         profile_context = (profile_context + "\n" + slang).strip()
     persona = group_persona(group_id) if group else ""
+    group_context = build_group_context(group_id) if group else ""
     with _reply_lock:
         reply, error = ask_core(
-            prompt, session, channel, speaker, profile_context, persona
+            prompt, session, channel, speaker,
+            profile_context, persona, group_context,
         )
 
     if error or not reply:
@@ -922,7 +936,8 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         retry_prompt = prompt + "\n（刚才你说过很相近的话，这次换个说法，别重复。）"
         with _reply_lock:
             retry, retry_error = ask_core(
-                retry_prompt, session, channel, speaker, profile_context, persona
+                retry_prompt, session, channel, speaker,
+                profile_context, persona, group_context,
             )
         if retry and not retry_error:
             reply = retry
