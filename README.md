@@ -139,7 +139,16 @@ curl -X POST http://127.0.0.1:8767/simulate/chat -H "Content-Type: application/j
 }'
 ```
 
-返回里每条消息的 `direct` 是“被叫必回”的判定，`observe` 是观察评估的激活度、是否发言和理由。`/simulate` 和 `/simulate/chat` 默认 `dry_run: true`，不会真发到群。运行日志在 `logs/qq-YYYY-MM-DD.log`，调用计数在 `data/qq_budget.json`（对话）和 `data/qq_observe_budget.json`（观察）。
+返回里每条消息的 `direct` 是“被叫必回”的判定，`observe` 是观察评估的激活度、是否发言和理由。`/simulate` 和 `/simulate/chat` 默认 `dry_run: true`，不会真发到群。
+
+测试“别人回复她”：她会把发出去的每条消息的 `message_id` 记在 `data/qq_bot_messages.json`（最多 100 条，重启不丢）。干跑时没有真实 id，可以先登记一个再引用：
+
+```bash
+curl -X POST http://127.0.0.1:8767/simulate -H "Content-Type: application/json" \
+  -d '{"message_type":"group","group_id":10000,"user_id":20000,"nickname":"小明","remember_id":555001,"reply_id":555001,"text":"哈哈你说得对"}'
+```
+
+返回 `reason: "回复了她"` 就说明识别成功；`reply_id` 换成没登记过的值则会判成“没被叫”。运行日志在 `logs/qq-YYYY-MM-DD.log`，调用计数在 `data/qq_budget.json`（对话）、`data/qq_observe_budget.json`（观察）。
 
 > 非官方 QQ 协议有封号风险，**务必用小号**。群聊是陌生人输入，提示词注入风险比私聊高，默认禁工具、禁私密记忆就是为这个。
 

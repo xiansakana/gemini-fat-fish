@@ -25,7 +25,7 @@ ssh -L 8766:127.0.0.1:8766 gcp
 ├── memory.json       网页端记忆（不进 git）
 ├── sessions/         各群 / 私聊记忆（不进 git）
 ├── logs/             server.log / bridge.log / qq-*.log
-└── data/             qq_budget.json / qq_observe_budget.json
+└── data/             qq_budget.json / qq_observe_budget.json / qq_bot_messages.json
 ```
 
 ## 首次安装（已执行）

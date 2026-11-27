@@ -383,11 +383,12 @@ def ask_core(text: str, session: str, channel: str, speaker: str) -> tuple[str, 
     return str(data.get("reply") or ""), data.get("error")
 
 
-def call_onebot(action: str, payload: dict) -> bool:
+def call_onebot(action: str, payload: dict) -> tuple[bool, str | None]:
+    """返回 (是否成功, OneBot 返回的 message_id)。"""
     api = onebot_api()
     if is_dry():
         print(f"[干跑] {action} {json.dumps(payload, ensure_ascii=False)[:300]}", flush=True)
-        return True
+        return True, None
     request = urllib.request.Request(
         f"{api}/{action}",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -399,11 +400,16 @@ def call_onebot(action: str, payload: dict) -> bool:
             result = json.load(response)
         if isinstance(result, dict) and result.get("retcode") not in (0, None):
             log_line(f"发送失败 {action}: {result}")
-            return False
-        return True
+            return False, None
+        message_id = None
+        if isinstance(result, dict):
+            data = result.get("data") or {}
+            if isinstance(data, dict) and data.get("message_id") is not None:
+                message_id = str(data["message_id"])
+        return True, message_id
     except Exception as exc:  # noqa: BLE001
         log_line(f"发送异常 {action}: {type(exc).__name__} {exc}")
-        return False
+        return False, None
 
 
 def build_segments(parts: list[str], group: bool, reply_id: str | None, user_id) -> list[list[dict]]:
@@ -428,16 +434,18 @@ def send_group_parts(group_id: str, parts: list[str], reply_id: str | None = Non
         for index, segments in enumerate(messages):
             if index:
                 time.sleep(0.8)
-            ok = call_onebot(
+            ok, message_id = call_onebot(
                 "send_group_msg", {"group_id": int(group_id), "message": segments}
             )
             if not ok and any(seg.get("type") == "at" for seg in segments):
                 fallback = [seg for seg in segments if seg.get("type") != "at"]
-                ok = call_onebot(
+                ok, message_id = call_onebot(
                     "send_group_msg", {"group_id": int(group_id), "message": fallback}
                 )
             if not ok:
                 return False
+            # 记下自己的消息 id，别人回复她时才能认出来
+            remember_bot_message(message_id)
     return True
 
 
@@ -499,15 +507,17 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
             for index, part in enumerate(parts):
                 if index:
                     time.sleep(0.8)
-                if not call_onebot(
+                sent, message_id = call_onebot(
                     "send_private_msg",
                     {
                         "user_id": int(user_id),
                         "message": [{"type": "text", "data": {"text": part}}],
                     },
-                ):
+                )
+                if not sent:
                     ok = False
                     break
+                remember_bot_message(message_id)
 
     if group:
         _group_last_reply[group_id] = time.time()
@@ -678,6 +688,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/simulate":
             body = self._body()
             _force_dry.value = bool(body.get("dry", True))
+            segments: list[dict] = []
+            if body.get("remember_id") is not None:
+                # 干跑时没有真实 message_id，先登记一个假的供测试
+                remember_bot_message(body["remember_id"])
+            if body.get("reply_id") is not None:
+                segments.append(
+                    {"type": "reply", "data": {"id": str(body["reply_id"])}}
+                )
+            segments.append(
+                {"type": "text", "data": {"text": body.get("text", "")}}
+            )
             event = {
                 "post_type": "message",
                 "message_type": body.get("message_type", "group"),
@@ -685,7 +706,7 @@ class Handler(BaseHTTPRequestHandler):
                 "user_id": body.get("user_id", "20000"),
                 "message_id": body.get("message_id", str(int(time.time()))),
                 "sender": {"nickname": body.get("nickname", "测试群友")},
-                "message": [{"type": "text", "data": {"text": body.get("text", "")}}],
+                "message": segments,
             }
             self._json(handle_event(event, simulated=True))
             return
@@ -706,6 +727,16 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 ts = base_ts + index * gap
                 msg_id = f"sim-{int(ts)}-{index}"
+                segments: list[dict] = []
+                if item.get("remember_id") is not None:
+                    remember_bot_message(item["remember_id"])
+                if item.get("reply_id") is not None:
+                    segments.append(
+                        {"type": "reply", "data": {"id": str(item["reply_id"])}}
+                    )
+                segments.append(
+                    {"type": "text", "data": {"text": str(item.get("text") or "")}}
+                )
                 event = {
                     "post_type": "message",
                     "message_type": "group",
@@ -713,7 +744,7 @@ class Handler(BaseHTTPRequestHandler):
                     "user_id": item.get("user_id", 20000 + index),
                     "message_id": msg_id,
                     "sender": {"nickname": str(item.get("nickname") or f"群友{index + 1}")[:20]},
-                    "message": [{"type": "text", "data": {"text": str(item.get("text") or "")}}],
+                    "message": segments,
                 }
                 direct = handle_event(event, simulated=True)
                 if direct.get("ok"):
