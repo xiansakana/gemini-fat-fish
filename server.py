@@ -540,7 +540,8 @@ def observe_group(messages: list[dict], probe: str = "") -> tuple[dict, dict]:
         text = str(item.get("text") or "")[:300].replace("\n", " ")
         if text:
             lines.append(f"{speaker}：{text}")
-    if len(lines) < 2:
+    probe_text = str(probe or "").strip()[:300].replace("\n", " ")
+    if len(lines) < (1 if probe_text else 2):
         return (
             {"activation": 0, "addressed": False, "speak": False,
              "reply": "", "reason": "上下文太短"},
@@ -548,7 +549,6 @@ def observe_group(messages: list[dict], probe: str = "") -> tuple[dict, dict]:
         )
 
     period, clock = time_context()
-    probe_text = str(probe or "").strip()[:300].replace("\n", " ")
     if probe_text:
         lines.append(f"【最新消息，要重点判断】{probe_text}")
     system_text = (

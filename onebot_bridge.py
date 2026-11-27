@@ -558,6 +558,8 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
 
     group = message_type == "group"
     group_id = str(event.get("group_id", ""))
+    user_id = event.get("user_id")
+    speaker = display_name(event)
     if group:
         log_line(
             f"[入站] {group_id} | {display_name(event)} | {text[:60]} | "
@@ -577,10 +579,8 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         log_line(f"[跳过] {group_id} | {reason}")
         return {"ok": False, "reason": reason}
 
-    user_id = event.get("user_id")
     session = f"group_{group_id}" if group else f"private_{user_id}"
     channel = "group" if group else "private"
-    speaker = display_name(event)
 
     now = time.time()
     if group:
