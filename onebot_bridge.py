@@ -210,6 +210,16 @@ def group_warmup() -> float:
     return _float_cfg("QQ_GROUP_WARMUP", 300, 0, 86400)
 
 
+def auto_accept_invite() -> bool:
+    """管理员邀请入群时自动同意，不然她根本进不去。"""
+    return cfg("QQ_AUTO_ACCEPT_INVITE", "1").lower() not in ("0", "false", "no", "off")
+
+
+def join_greet_enabled() -> bool:
+    """被拉进一个还没人说话的新群时，打个招呼。"""
+    return cfg("QQ_JOIN_GREET", "1").lower() not in ("0", "false", "no", "off")
+
+
 def is_dry() -> bool:
     return bool(getattr(_force_dry, "value", False)) or not bool(onebot_api())
 
@@ -808,6 +818,34 @@ def backfill_group(
     }
 
 
+def on_bot_joined(group_id: str) -> None:
+    """自己被拉进群的完整流程：补历史 → 读群资料 → 空群就打个招呼。"""
+    result = backfill_group(group_id, warmup=True)
+    if not result.get("ok"):
+        log_line(f"[进群] {group_id} | 没补成：{result.get('reason')}")
+        return
+    if not join_greet_enabled():
+        return
+    # 老群有历史，进去就说话很突兀；只有基本没人说过话的新群才打招呼
+    if int(result.get("fetched") or 0) >= 5:
+        log_line(f"[进群] {group_id} | 群里有历史，先潜水")
+        return
+    if random.random() > max(0.0, notice_rate()):
+        return
+    reply = ask_event("你刚被拉进一个还没人说话的新群", intro_context(group_id))
+    if not reply:
+        return
+    parts = split_reply(clean_for_group(reply))
+    if not parts:
+        return
+    ok = send_group_parts(group_id, parts)
+    remember_bot_said(group_id, reply)
+    with _observe_lock:
+        _group_last_reply[group_id] = time.time()
+        _group_last_bot_text[group_id] = "\n".join(parts)
+    log_line(f"[进群] {group_id} | 打招呼：{reply[:100]} | sent={ok}")
+
+
 def ask_observe(messages: list[dict], probe: str = "", intro: str = "") -> dict:
     payload = json.dumps(
         {"messages": messages, "probe": probe, "intro": intro}, ensure_ascii=False
@@ -1153,10 +1191,9 @@ def handle_notice(event: dict) -> dict:
     join_types = ("group_increase", "group_member_increase", "group_member_join")
 
     # 自己被拉进新群：先把能拿到的历史补上，新群也要先看一会儿再说话
+    # 自己被拉进新群：补历史、读群资料，空群再打个招呼
     if notice_type in join_types and str(event.get("user_id")) == cfg("QQ_BOT_QQ") and cfg("QQ_BOT_QQ"):
-        threading.Thread(
-            target=backfill_group, args=(group_id,), kwargs={"warmup": True}, daemon=True
-        ).start()
+        threading.Thread(target=on_bot_joined, args=(group_id,), daemon=True).start()
         log_line(f"[进群] {group_id} | 自己被拉进群，开始补历史")
         return {"ok": True, "reason": "自己进群，开始补历史", "group_id": group_id}
 
@@ -1200,6 +1237,36 @@ def handle_notice(event: dict) -> dict:
     return {
         "ok": True, "reason": "群事件回应", "reply": reply,
         "parts": parts, "sent": ok,
+    }
+
+
+def handle_request(event: dict) -> dict:
+    """有人邀请入群：只接受管理员的邀请，并自动同意。"""
+    if str(event.get("request_type")) != "group":
+        return {"ok": False, "reason": "非群请求"}
+    group_id = str(event.get("group_id", ""))
+    sub_type = str(event.get("sub_type") or "")
+    if sub_type not in ("invite", "add"):
+        return {"ok": False, "reason": "不是邀请入群"}
+    inviter = str(event.get("user_id") or "")
+    if inviter not in admin_qq():
+        log_line(f"[入群邀请] {group_id} | 邀请人 {inviter} 不是管理员，忽略")
+        return {"ok": False, "reason": "邀请人不是管理员"}
+    if not auto_accept_invite():
+        log_line(f"[入群邀请] {group_id} | 自动同意已关闭")
+        return {"ok": False, "reason": "自动同意已关闭"}
+    flag = str(event.get("flag") or "")
+    if not flag:
+        return {"ok": False, "reason": "缺少 flag"}
+    ok, _ = call_onebot(
+        "set_group_add_request",
+        {"flag": flag, "sub_type": sub_type, "approve": True},
+    )
+    log_line(f"[入群邀请] {group_id} | 邀请人 {inviter} | 已同意={ok}")
+    return {
+        "ok": bool(ok),
+        "reason": "已同意入群" if ok else "同意失败",
+        "group_id": group_id,
     }
 
 
@@ -1305,6 +1372,8 @@ def handle_group_command(group_id: str, user_id, text: str) -> dict | None:
 
 def handle_event(event: dict, simulated: bool = False) -> dict:
     """返回处理结果，便于模拟器直接看到判定过程。"""
+    if event.get("post_type") == "request":
+        return handle_request(event)
     if event.get("post_type") == "notice":
         return handle_notice(event)
     if event.get("post_type") not in (None, "message"):
@@ -1612,6 +1681,10 @@ class Handler(BaseHTTPRequestHandler):
                         "count": backfill_count(),
                         "buffer_max": buffer_max(),
                         "warmup": int(group_warmup()),
+                    },
+                    "invite": {
+                        "auto_accept": auto_accept_invite(),
+                        "greet": join_greet_enabled(),
                     },
                     "talk_value": {gid: get_talk_value(gid) for gid in sorted(known_groups())},
                     "threshold": {gid: dynamic_threshold(gid) for gid in sorted(known_groups())},
