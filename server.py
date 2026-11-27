@@ -871,6 +871,7 @@ def call_gemini(
         return "还没填 API Key，去 .env 里写 GEMINI_API_KEY。", {}, "缺少 API Key", []
 
     group = channel == "group"
+    force_search = group and search_requested(message)
     model = str(CFG.get("QQ_GROUP_MODEL") or "").strip() if group else ""
     max_tokens = (
         int(CFG.get("QQ_GROUP_MAX_TOKENS") or 260)
@@ -911,8 +912,6 @@ def call_gemini(
     generation_config = {"maxOutputTokens": max_tokens}
     if CFG["THINKING_LEVEL"] and not group:
         generation_config["thinkingConfig"] = {"thinkingLevel": CFG["THINKING_LEVEL"]}
-
-    force_search = group and search_requested(message)
 
     events: list[dict] = []
     usage_total = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
