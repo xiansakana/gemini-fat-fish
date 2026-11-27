@@ -41,6 +41,8 @@ _observe_lock = threading.Lock()
 _force_dry = threading.local()
 _group_last_reply: dict[str, float] = {}
 _group_last_observe: dict[str, float] = {}
+_group_last_probe: dict[str, float] = {}
+_group_last_bot_text: dict[str, str] = {}
 _group_buffer: dict[str, list[dict]] = {}
 _group_cursor: dict[str, int] = {}
 _group_seq: dict[str, int] = {}
@@ -131,6 +133,18 @@ def observe_threshold() -> int:
 
 def observe_cooldown() -> float:
     return _float_cfg("QQ_OBSERVE_COOLDOWN", 240, 30, 86400)
+
+
+def context_probe_enabled() -> bool:
+    return cfg("QQ_CONTEXT_PROBE", "1").lower() not in ("0", "false", "no", "off")
+
+
+def context_probe_window() -> float:
+    return _float_cfg("QQ_CONTEXT_PROBE_WINDOW", 180, 30, 3600)
+
+
+def context_probe_gap() -> float:
+    return _float_cfg("QQ_CONTEXT_PROBE_GAP", 12, 3, 300)
 
 
 def observe_daily_calls() -> int:
@@ -238,8 +252,8 @@ def mark_consumed(group_id: str) -> None:
         _group_cursor[group_id] = int(buffer[-1]["seq"])
 
 
-def ask_observe(messages: list[dict]) -> dict:
-    payload = json.dumps({"messages": messages}, ensure_ascii=False).encode("utf-8")
+def ask_observe(messages: list[dict], probe: str = "") -> dict:
+    payload = json.dumps({"messages": messages, "probe": probe}, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         core_url() + "/api/observe",
         data=payload,
@@ -252,10 +266,78 @@ def ask_observe(messages: list[dict]) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {
             "activation": 0,
+            "addressed": False,
             "speak": False,
             "reply": "",
             "reason": f"评估接口异常：{type(exc).__name__} {exc}",
         }
+
+
+def looks_like_followup(text: str) -> bool:
+    """像接话的短追问才值得再花一次 lite 调用。"""
+    text = (text or "").strip()
+    if not text or len(text) > 60:
+        return False
+    if "?" in text or "？" in text:
+        return True
+    starters = ("所以", "那", "那么", "你", "怎么", "为什么", "哪儿", "哪里",
+                "几点", "真的", "嗯", "哦", "行吧", "好了", "说完了", "还有")
+    return any(text.startswith(word) for word in starters)
+
+
+def probe_context(group_id: str, speaker: str, text: str) -> dict | None:
+    """没被 @ 时，结合上下文判断这句话是不是在跟她说话。"""
+    if not context_probe_enabled() or not looks_like_followup(text):
+        return None
+    now = time.time()
+    if now - float(_group_last_probe.get(group_id, 0.0)) < context_probe_gap():
+        return None
+    last_reply = float(_group_last_reply.get(group_id, 0.0))
+    if not last_reply or now - last_reply > context_probe_window():
+        return None
+    if not observe_budget_ok():
+        return None
+    _group_last_probe[group_id] = now
+
+    history = list(_group_buffer.get(group_id, [])[-10:-1])
+    last_bot_text = _group_last_bot_text.get(group_id, "")
+    if last_bot_text:
+        history.append({"speaker": "我（Gemini娘）", "text": last_bot_text[:300]})
+    decision = ask_observe(history, probe=f"{speaker}：{text}")
+    log_line(
+        f"[上下文判定] {group_id} | {speaker} | {text[:40]} | "
+        f"addressed={decision.get('addressed')} 激活度={decision.get('activation')} "
+        f"| {decision.get('reason')}"
+    )
+    if decision.get("addressed") and decision.get("reply"):
+        return decision
+    return None
+
+
+def send_contextual_reply(group_id: str, user_id, decision: dict) -> dict:
+    reply = str(decision.get("reply") or "")
+    parts = split_reply(clean_for_group(reply))
+    if not parts:
+        return {"ok": False, "reason": "上下文回复为空"}
+    ok = send_group_parts(group_id, parts)
+    now = time.time()
+    _group_last_reply[group_id] = now
+    _group_last_bot_text[group_id] = "\n".join(parts)
+    mark_consumed(group_id)
+    log_line(
+        f"[上下文回复] {group_id} | 激活度 {decision.get('activation')} | "
+        f"{reply[:120]}"
+    )
+    return {
+        "ok": True,
+        "reason": "上下文指向她",
+        "session": f"group_{group_id}",
+        "reply": reply,
+        "parts": parts,
+        "sent": ok,
+        "dry_run": is_dry(),
+        "simulated": True,
+    }
 
 
 def remember_bot_message(message_id) -> None:
@@ -488,6 +570,10 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     reply_to_bot = is_reply_to_bot(reply_id)
     engage, reason = should_engage(event, text, at_self, reply_to_bot)
     if not engage:
+        if group:
+            decision = probe_context(group_id, speaker, text)
+            if decision:
+                return send_contextual_reply(group_id, user_id, decision)
         log_line(f"[跳过] {group_id} | {reason}")
         return {"ok": False, "reason": reason}
 
@@ -546,6 +632,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
 
     if group:
         _group_last_reply[group_id] = time.time()
+        _group_last_bot_text[group_id] = "\n".join(parts)
         # 她刚开口，之前攒的上下文别再拿来触发一次主动发言
         mark_consumed(group_id)
     log_line(f"{session} | {speaker} | {text} | {reply[:200]}")
@@ -624,6 +711,7 @@ def evaluate_group(
             with _observe_lock:
                 _group_last_observe[group_id] = now
                 _group_last_reply[group_id] = now
+                _group_last_bot_text[group_id] = "\n".join(parts)
             log_line(
                 f"group_{group_id} | 主动发言 | 激活度 {activation}/10 | "
                 f"{reason} | {str(decision['reply'])[:120]}"
@@ -698,6 +786,7 @@ class Handler(BaseHTTPRequestHandler):
                     "observe_interval": int(observe_interval()),
                     "observe_min_messages": observe_min_messages(),
                     "observe_daily_calls": observe_daily_calls(),
+                    "context_probe": context_probe_enabled(),
                     "dry": is_dry(),
                 }
             )
