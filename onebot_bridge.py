@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import random
 import re
@@ -37,6 +38,7 @@ BOT_MESSAGES_FILE = DATA_DIR / "qq_bot_messages.json"
 TALK_VALUE_FILE = DATA_DIR / "qq_talk_value.json"
 PROFILE_FILE = DATA_DIR / "qq_profiles.json"
 PERSONA_FILE = DATA_DIR / "qq_personas.json"
+SLANG_FILE = DATA_DIR / "qq_slang.json"
 
 CORE_TIMEOUT = 90
 _reply_lock = threading.Lock()
@@ -48,6 +50,8 @@ _group_last_probe: dict[str, float] = {}
 _group_last_bot_text: dict[str, str] = {}
 _group_recent_replies: dict[str, list[str]] = {}
 _group_talk_value: dict[str, float] = {}
+_group_summary_counter: dict[str, int] = {}
+_group_slang_counter: dict[str, int] = {}
 _group_buffer: dict[str, list[dict]] = {}
 _group_cursor: dict[str, int] = {}
 _group_seq: dict[str, int] = {}
@@ -142,6 +146,10 @@ def observe_threshold() -> int:
 
 def observe_cooldown() -> float:
     return _float_cfg("QQ_OBSERVE_COOLDOWN", 240, 30, 86400)
+
+
+def sticker_rate() -> float:
+    return _float_cfg("QQ_STICKER_RATE", 0.08, 0.0, 1.0)
 
 
 def context_probe_enabled() -> bool:
@@ -408,6 +416,77 @@ def build_profile_context(group_id: str) -> str:
 def group_persona(group_id: str) -> str:
     data = load_json(PERSONA_FILE, {})
     return str(data.get(group_id) or "").strip()
+
+
+def ask_summary(session: str, messages: list[dict]) -> str:
+    payload = json.dumps(
+        {"session": session, "messages": messages}, ensure_ascii=False
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        core_url() + "/api/summarize",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.load(response)
+        return str(data.get("summary") or "")
+    except Exception as exc:  # noqa: BLE001
+        log_line(f"摘要失败 {type(exc).__name__} {exc}")
+        return ""
+
+
+def ask_slang(messages: list[dict]) -> list[str]:
+    payload = json.dumps({"messages": messages}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        core_url() + "/api/slang",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.load(response)
+        return [str(x) for x in (data.get("terms") or [])][:5]
+    except Exception as exc:  # noqa: BLE001
+        log_line(f"黑话挖掘失败 {type(exc).__name__} {exc}")
+        return []
+
+
+def maybe_remember_group(group_id: str) -> None:
+    """攒够消息就写一条摘要 / 挖一次黑话，都走观察额度。"""
+    recent = [
+        {"speaker": item.get("speaker", ""), "text": item.get("text", "")}
+        for item in _group_buffer.get(group_id, [])[-24:]
+    ]
+    if len(recent) < 8:
+        return
+    counter = int(_group_summary_counter.get(group_id, 0)) + 1
+    _group_summary_counter[group_id] = counter
+    if counter >= 20:
+        _group_summary_counter[group_id] = 0
+        if observe_budget_ok():
+            text = ask_summary(f"group_{group_id}", recent)
+            if text:
+                log_line(f"[摘要] {group_id} | {text[:80]}")
+
+    slang_counter = int(_group_slang_counter.get(group_id, 0)) + 1
+    _group_slang_counter[group_id] = slang_counter
+    if slang_counter >= 60:
+        _group_slang_counter[group_id] = 0
+        if observe_budget_ok():
+            terms = ask_slang(recent)
+            if terms:
+                data = load_json(SLANG_FILE, {})
+                data[group_id] = terms
+                save_json(SLANG_FILE, data)
+                log_line(f"[黑话] {group_id} | {'、'.join(terms)}")
+
+
+def slang_context(group_id: str) -> str:
+    terms = load_json(SLANG_FILE, {}).get(group_id) or []
+    return "【群里黑话】" + "、".join(str(x) for x in terms[:5]) if terms else ""
 
 
 def ask_observe(messages: list[dict], probe: str = "") -> dict:
@@ -691,6 +770,14 @@ def send_group_parts(group_id: str, parts: list[str], reply_id: str | None = Non
     if not parts:
         return False
     messages = build_segments(parts, True, reply_id, user_id)
+    if not is_dry() and sticker_rate() > 0 and random.random() < sticker_rate():
+        stickers = sorted((ROOT / "static" / "expressions").glob("*.png"))
+        if stickers:
+            encoded = base64.b64encode(random.choice(stickers).read_bytes()).decode("ascii")
+            messages[-1].append(
+                {"type": "image", "data": {"file": f"base64://{encoded}"}}
+            )
+            log_line(f"[表情] {group_id} | 随消息附了一张表情差分")
     with _reply_lock:
         for index, segments in enumerate(messages):
             if index:
@@ -781,6 +868,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     if group and group_id and str(event.get("user_id")) != cfg("QQ_BOT_QQ"):
         record_group_message(group_id, display_name(event), text)
         update_profile(group_id, user_id, speaker, text, time.time())
+        maybe_remember_group(group_id)
 
     reply_to_bot = is_reply_to_bot(reply_id)
     engage, reason = should_engage(event, text, at_self, reply_to_bot)
@@ -816,6 +904,9 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
 
     prompt = f"{speaker}：{text}" if group else text
     profile_context = build_profile_context(group_id) if group else ""
+    slang = slang_context(group_id) if group else ""
+    if slang:
+        profile_context = (profile_context + "\n" + slang).strip()
     persona = group_persona(group_id) if group else ""
     with _reply_lock:
         reply, error = ask_core(
