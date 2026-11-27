@@ -90,11 +90,44 @@ TOOL_DECLARATIONS = [
         },
     },
     {
+        "name": "finquote",
+        "description": (
+            "查股票/指数/基金实时行情：最新价、涨跌幅、高低点，A 股港股美股都行。"
+            "对方问到行情、股价、大盘、抄底、涨跌时，必须先用这个工具拿真实数字，"
+            "不要用 web_search 搜行情（搜回来的网页描述没有实时数据），更不许凭记忆编数字。"
+            "一次可以查多个，逗号隔开。"
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "names": {
+                    "type": "STRING",
+                    "description": "名称或代码，逗号隔开。如：上证指数,贵州茅台 或 sh000001,600519",
+                },
+            },
+            "required": ["names"],
+        },
+    },
+    {
+        "name": "finnews",
+        "description": (
+            "查财经消息面/市场新闻：新浪财经 7x24 快讯，分钟级更新。"
+            "对方问到消息面、市场新闻、财经资讯时用这个，比 web_search 快且准。"
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "limit": {"type": "INTEGER", "description": "要几条，默认 12"},
+            },
+        },
+    },
+    {
         "name": "web_search",
         "description": (
             "搜索当前网上的实时信息，返回标题、链接和摘要。"
-            "当对方明确要求查行情、查新闻、查价格、查资料，或问到你不确定的实时信息时，"
-            "必须先用这个工具拿到真实结果再回答，不要凭记忆编造。"
+            "股票/指数行情用 finquote，财经消息面用 finnews，这两个更准；"
+            "其余实时信息（新闻、价格、资料）才用这个，"
+            "必须先拿到真实结果再回答，不要凭记忆编造。"
             "关键词要具体（如“上证指数 今日收盘”），一次就够了。"
         ),
         "parameters": {
@@ -126,7 +159,12 @@ TOOL_DECLARATIONS = [
 ]
 
 # 群聊只放只读的联网工具，文件 / 终端工具仍然只在网页端可用
-GROUP_TOOL_NAMES = {"browse", "web_search", "bilibili_video", "bilibili_popular"}
+GROUP_TOOL_NAMES = {
+    "browse", "web_search", "finquote", "finnews", "bilibili_video", "bilibili_popular",
+}
+
+# 查询类工具一轮各只许调一次，防止绕圈
+ONCE_TOOLS = {"web_search", "finquote", "finnews"}
 
 DEFAULTS = {
     "GEMINI_API_KEY": "",
@@ -615,6 +653,14 @@ def tool_web_search(args: dict) -> str:
     return net_tools.search_web(str(args.get("query", "")), int(args.get("limit") or 5))
 
 
+def tool_finquote(args: dict) -> str:
+    return net_tools.finquote(str(args.get("names", "")))
+
+
+def tool_finnews(args: dict) -> str:
+    return net_tools.finnews(int(args.get("limit") or 12))
+
+
 def tool_bilibili_video(args: dict) -> str:
     return net_tools.bilibili_video(str(args.get("bvid", "")))
 
@@ -630,6 +676,8 @@ TOOL_DISPATCH = {
     "run_command": tool_run_command,
     "browse": tool_browse,
     "web_search": tool_web_search,
+    "finquote": tool_finquote,
+    "finnews": tool_finnews,
     "bilibili_video": tool_bilibili_video,
     "bilibili_popular": tool_bilibili_popular,
 }
@@ -912,8 +960,9 @@ def call_gemini(
         if force_search:
             parts_.append({"text": (
                 "（系统指令，最高优先级：这条消息明确要求查实时信息。"
-                "先调用 web_search 工具拿真实结果，再用你的口吻回答；"
-                "禁止编造行情，禁止用“懒得查”“自己看”推脱。）"
+                "先调工具拿真实结果再回答：股票/指数/行情/涨跌用 finquote，"
+                "财经消息面/市场新闻用 finnews，其他实时信息用 web_search；"
+                "禁止编造行情数字，禁止用“懒得查”“自己看”推脱。）"
             )})
         contents.append({"role": "user", "parts": parts_})
 
@@ -924,7 +973,7 @@ def call_gemini(
     events: list[dict] = []
     usage_total = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-    searched = False
+    searched: set[str] = set()
     for _ in range(3 if group else 6):
         payload = {
             "system_instruction": {
@@ -979,14 +1028,14 @@ def call_gemini(
             handler = TOOL_DISPATCH.get(name)
             if handler is None:
                 result = "不认识这个工具：" + name
-            elif name == "web_search" and searched:
+            elif name in ONCE_TOOLS and name in searched:
                 result = (
-                    "这一轮已经搜过一次了，不要再调用任何工具。"
-                    "直接根据上面已拿到的搜索结果，用你自己的口吻回答对方。"
+                    "这一轮已经查过了，不要再调用任何工具。"
+                    "直接根据上面已拿到的结果，用你自己的口吻回答对方。"
                 )
             else:
-                if name == "web_search":
-                    searched = True
+                if name in ONCE_TOOLS:
+                    searched.add(name)
                 try:
                     result = str(handler(args))
                 except Exception as exc:  # noqa: BLE001

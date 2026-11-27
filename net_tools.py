@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""给 Gemini 娘用的联网工具：搜索、读网页、看 B 站。
+"""给 Gemini 娘用的联网工具：搜索、读网页、看 B 站、查行情和财经快讯。
 
 只读、无登录态、结果都压成短文本交给模型；所有 URL 都做 SSRF 过滤，
 避免被群里的人拿来探测内网或云元数据。
@@ -264,6 +264,187 @@ def bilibili_video(bvid: str, replies: int = 4) -> str:
     except Exception:  # noqa: BLE001
         pass
     lines.append(f"链接：https://www.bilibili.com/video/{code}")
+    return "\n".join(lines)
+
+
+# ---------------- 行情与财经快讯 ----------------
+# 通用搜索引擎(Bing RSS)搜中文财经只会返回网页链接描述，拿不到实时数字，
+# 所以行情和消息面走专用源：腾讯行情 qt.gtimg.cn + 新浪财经 7x24 快讯。
+
+INDEX_CODES = {
+    "上证指数": "sh000001", "上证综指": "sh000001", "上证": "sh000001",
+    "大盘": "sh000001", "沪指": "sh000001",
+    "深证成指": "sz399001", "深成指": "sz399001", "深指": "sz399001",
+    "创业板指": "sz399006", "创业板": "sz399006",
+    "沪深300": "sh000300", "沪深三百": "sh000300",
+    "科创50": "sh000688",
+    "中证500": "sh000905",
+    "中证1000": "sh000852",
+    "恒生指数": "hkHSI", "恒生": "hkHSI",
+    "道琼斯": "usDJI", "纳指": "usIXIC", "纳斯达克": "usIXIC",
+    "标普500": "usINX", "标普": "usINX",
+}
+
+
+def _decode_u_escapes(text: str) -> str:
+    """smartbox 返回的是字面 \\uXXXX 序列，这里手工还原成汉字。"""
+    return re.sub(
+        r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text
+    )
+
+
+def _tencent_code(name: str) -> str:
+    """把名称或代码解析成腾讯行情代码；解析不了返回空串。"""
+    text = str(name or "").strip().lower()
+    if not text:
+        return ""
+    if text in INDEX_CODES:
+        return INDEX_CODES[text]
+    for key, value in INDEX_CODES.items():
+        if key in text and len(text) <= len(key) + 2:
+            return value
+    match = re.fullmatch(r"(sh|sz|hk|us)?(\d{5,6})", text)
+    if match:
+        prefix, digits = match.group(1) or "", match.group(2)
+        if prefix:
+            return prefix + digits
+        if digits.startswith(("6", "9", "5")):
+            return "sh" + digits
+        if digits.startswith(("0", "2", "3")):
+            return "sz" + digits
+    # 名称搜代码：smartbox 返回 sh~600519~贵州茅台~gzmt~GP-A^...^
+    url = "https://smartbox.gtimg.cn/s3/?v=2&t=all&" + urllib.parse.urlencode({"q": text})
+    try:
+        raw = _decode(_http_get(url, timeout=8))
+        hint = re.search(r'v_hint="([^"]*)"', raw)
+        if not hint:
+            return ""
+        first = _decode_u_escapes(hint.group(1)).split("^")[0]
+        parts = first.split("~")
+        if len(parts) >= 2 and parts[0] in ("sh", "sz", "hk", "us", "bj"):
+            return parts[0] + parts[1]
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _parse_quote(payload: str) -> dict:
+    match = re.search(r'v_([a-z]+\w*)="([^"]*)"', payload)
+    if not match:
+        return {}
+    fields = match.group(2).split("~")
+    if len(fields) < 35 or not fields[3]:
+        return {}
+
+    def pick(index: str) -> str:
+        return fields[int(index)] if int(index) < len(fields) else ""
+
+    code = match.group(1)
+    if code.startswith("v_"):
+        code = code[2:]
+    stamp = pick("30")  # 形如 20261127161427
+    when = ""
+    if len(stamp) == 14:
+        when = f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[8:10]}:{stamp[10:12]}"
+    return {
+        "code": code,
+        "name": pick("1"),
+        "price": pick("3"),
+        "prev_close": pick("4"),
+        "open": pick("5"),
+        "change": pick("31"),
+        "pct": pick("32"),
+        "high": pick("33"),
+        "low": pick("34"),
+        "turnover": pick("38"),
+        "amount": pick("37"),
+        "pe": pick("39"),
+        "market_cap": pick("45"),
+        "when": when,
+    }
+
+
+def _format_quote(q: dict) -> str:
+    try:
+        change = float(q["change"])
+        sign = "+" if change >= 0 else ""
+    except (KeyError, ValueError):
+        sign = ""
+    bits = [f"{q['name']}({q['code']}) 最新 {q['price']}"]
+    if q["change"] and q["pct"]:
+        bits.append(f"{sign}{q['change']}（{sign}{q['pct']}%）")
+    for label, key in (("昨收", "prev_close"), ("今开", "open"), ("最高", "high"), ("最低", "low")):
+        if q.get(key):
+            bits.append(f"{label} {q[key]}")
+    # 指数（sh000xxx / sz399xxx）的换手和市值字段是成交额，展示出来会误导
+    is_index = bool(re.match(r"^(sh000|sz399|us|hk)", q.get("code", "")))
+    if not is_index and q.get("turnover") and q["turnover"] not in ("-", "0.00"):
+        bits.append(f"换手 {q['turnover']}%")
+    if not is_index and q.get("market_cap") and q["market_cap"] not in ("-", "0.00"):
+        try:
+            cap = float(q["market_cap"])
+            bits.append(f"总市值 {cap / 1e8:.0f} 亿" if cap >= 1e8 else f"总市值 {cap:.0f}")
+        except ValueError:
+            pass
+    if q.get("when"):
+        bits.append(f"截至 {q['when']}")
+    return "，".join(bits)
+
+
+def finquote(names: str) -> str:
+    """查指数/个股实时行情。names 逗号分隔，可以是中文名或代码。"""
+    tokens = [item for item in re.split(r"[,，、\s]+", str(names or "")) if item][:6]
+    if not tokens:
+        return "要查哪个？给个名称（如 上证指数、贵州茅台）或代码（如 600519）。"
+    codes: list[str] = []
+    missed: list[str] = []
+    for token in tokens:
+        code = _tencent_code(token)
+        if code:
+            codes.append(code)
+        else:
+            missed.append(token)
+    if not codes:
+        return "没认出这些代码或名称：" + "、".join(missed)
+    try:
+        raw = _decode(_http_get("https://qt.gtimg.cn/q=" + ",".join(codes), timeout=8))
+    except Exception as exc:  # noqa: BLE001
+        return f"行情接口挂了：{type(exc).__name__}"
+    lines = []
+    for chunk in re.findall(r'v_[a-z]+\w+="[^"]*"', raw):
+        quote = _parse_quote(chunk)
+        if quote:
+            lines.append(_format_quote(quote))
+    if not lines:
+        return "行情接口没返回数据。"
+    for token in missed:
+        lines.append(f"「{token}」没认出来，试试代码。")
+    return "\n".join(lines)
+
+
+def finnews(limit: int = 12) -> str:
+    """新浪财经 7x24 快讯，拿最近的财经新闻要点。"""
+    limit = max(3, min(20, int(limit or 12)))
+    url = (
+        "https://zhibo.sina.com.cn/api/zhibo/feed?"
+        + urllib.parse.urlencode(
+            {"page": 1, "page_size": limit, "zhibo_id": 152, "tag_id": 0, "dire": "f", "dpc": 1}
+        )
+    )
+    try:
+        data = _json_get(url, timeout=10)
+    except Exception as exc:  # noqa: BLE001
+        return f"快讯接口挂了：{type(exc).__name__}"
+    items = ((data.get("result", {}).get("data", {}) or {}).get("feed", {}) or {}).get("list") or []
+    if not items:
+        return "快讯接口没返回内容。"
+    lines = [f"新浪财经 7x24 快讯（最新 {len(items)} 条）："]
+    for item in items:
+        text = strip_html(str(item.get("rich_text", "")))[:120]
+        when = str(item.get("create_time", ""))[11:16]
+        tags = item.get("tag") or []
+        tag = f"[{tags[0].get('name')}]" if tags else ""
+        lines.append(f"{when} {tag}{text}")
     return "\n".join(lines)
 
 
