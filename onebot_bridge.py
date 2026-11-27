@@ -1863,6 +1863,7 @@ class Handler(BaseHTTPRequestHandler):
                             "intro": bool(intro_context(gid)),
                             "backfilled_at": int(_backfilled.get(gid, 0)),
                             "warmup_left": max(0, int(_group_warmup.get(gid, 0) - time.time())),
+                            "style": build_style_context(gid),
                         }
                         for gid in sorted(known_groups())
                     }
