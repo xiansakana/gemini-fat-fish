@@ -11,6 +11,11 @@
                                    └─ gemini-fish-update.timer 每 5 分钟拉一次 git
 ```
 
+## 时区
+
+主机时区是 `Asia/Shanghai`（`timedatectl set-timezone Asia/Shanghai`），NapCat 容器也带 `TZ=Asia/Shanghai`。
+她读时间走 `TZ_OFFSET`（`.env` 里设 `8`），留空则跟随系统时区——换机器时用它兜底，避免又答成 UTC。
+
 ## 后台日志页
 
 `deploy/logview.py` 是一个只读日志页，覆盖群消息、桥 stdout/stderr、核心 journal、NapCat 容器日志、自动更新日志，外加一个「运行状态」标签看服务、容器和桥的 health。
