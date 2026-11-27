@@ -113,9 +113,9 @@ def search_web(query: str, limit: int = 5) -> str:
     cached = SEARCH_CACHE.get(query)
     if cached and time.time() - cached[0] < 600:
         return cached[1]
-    items = _search_ddg(query, limit)
+    items = _search_rss(query, limit)
     if not items:
-        items = _search_bing_rendered(query, limit)
+        items = _search_ddg(query, limit)
     if not items:
         return f"没搜到「{query}」的结果，可能被限流了，等会儿再试。"
     result = f"搜索「{query}」的结果：\n" + "\n".join(items)
@@ -126,24 +126,26 @@ def search_web(query: str, limit: int = 5) -> str:
     return result
 
 
-def _search_bing_rendered(query: str, limit: int) -> list[str]:
-    """纯 HTTP 会被 Bing 塞垃圾结果，真浏览器渲染才靠谱。"""
-    url = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": query})
-    dom = render_url(url, timeout=45)
-    if len(dom) < 2000:
+def _search_rss(query: str, limit: int) -> list[str]:
+    """Bing 的 RSS 结果没有反爬，速度快、排序也正常。"""
+    import xml.etree.ElementTree as ET
+
+    url = "https://www.bing.com/search?" + urllib.parse.urlencode(
+        {"q": query, "format": "rss", "count": limit}
+    )
+    try:
+        raw = _decode(_http_get(url, timeout=12))
+        root = ET.fromstring(raw)
+    except Exception:  # noqa: BLE001
         return []
     items: list[str] = []
-    for block in re.findall(r'<li class="b_algo".*?</li>', dom, flags=re.S)[:limit * 2]:
-        link = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, flags=re.S)
-        if not link:
+    for node in root.findall(".//item")[:limit]:
+        title = (node.findtext("title") or "").strip()
+        link = (node.findtext("link") or "").strip()
+        desc = strip_html(node.findtext("description") or "")[:200].replace("阅读更多", "").strip()
+        if not title:
             continue
-        title = strip_html(link.group(2))[:120]
-        href = html_lib.unescape(link.group(1))
-        snippet = re.search(r"<p[^>]*>(.*?)</p>", block, flags=re.S)
-        summary = strip_html(snippet.group(1))[:220].replace("阅读更多", "").strip() if snippet else ""
-        items.append(f"{len(items) + 1}. {title}\n   {href}\n   {summary}")
-        if len(items) >= limit:
-            break
+        items.append(f"{len(items) + 1}. {title[:120]}\n   {link}\n   {desc}")
     return items
 
 
@@ -171,8 +173,8 @@ def render_url(url: str, timeout: int = 40) -> str:
     command = [
         "chromium", "--headless", "--no-sandbox", "--disable-gpu",
         "--disable-dev-shm-usage", "--hide-scrollbars", "--mute-audio",
-        "--user-data-dir", profile,
-        "--user-agent", UA, "--virtual-time-budget=8000", "--dump-dom", url,
+        f"--user-data-dir={profile}",
+        f"--user-agent={UA}", "--virtual-time-budget=4000", "--dump-dom", url,
     ]
     if not BROWSER_LOCK.acquire(timeout=15):
         shutil.rmtree(profile, ignore_errors=True)
