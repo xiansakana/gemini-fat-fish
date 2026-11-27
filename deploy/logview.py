@@ -201,13 +201,17 @@ pre.nowrap { white-space: pre; word-break: normal; overflow-x: auto; }
       <option value="10000">10 秒</option>
     </select>
     <button id="wrap">折行</button>
+    <button id="order">倒序</button>
     <button id="copy">复制</button>
   </div>
 </header>
 <div class="meta" id="meta">正在加载…</div>
 <pre id="log"></pre>
 <script>
-const state = { src: 'bridge', wrap: true, timer: null, stick: true, at: 0 };
+const state = { src: 'bridge', wrap: true, timer: null, stick: true, at: 0, desc: true };
+try {
+  state.desc = localStorage.getItem('lv_order') !== 'asc';
+} catch (e) { /* 隐私模式下忽略 */ }
 const logEl = document.getElementById('log');
 const metaEl = document.getElementById('meta');
 const dotEl = document.getElementById('dot');
@@ -228,9 +232,10 @@ function applyFilters(lines) {
   return lines.filter((line) => line.toLowerCase().includes(needle));
 }
 
-function render(lines) {
+function render(lines, desc = state.desc) {
+  const ordered = desc ? lines.slice().reverse() : lines;
   const frag = document.createDocumentFragment();
-  for (const line of lines) {
+  for (const line of ordered) {
     const span = document.createElement('span');
     const cls = colorize(line);
     if (cls) span.className = cls;
@@ -238,7 +243,7 @@ function render(lines) {
     frag.appendChild(span);
   }
   logEl.replaceChildren(frag);
-  if (state.stick) logEl.scrollTop = logEl.scrollHeight;
+  if (state.stick) logEl.scrollTop = desc ? 0 : logEl.scrollHeight;
 }
 
 async function load() {
@@ -259,7 +264,7 @@ async function load() {
       for (const [name, size] of Object.entries(s.log_files || {})) {
         lines.push(`  ${name.padEnd(28)} ${(size / 1024).toFixed(1)} KB`);
       }
-      render(lines);
+      render(lines, false);
       state.at = Date.now() / 1000;
       dotEl.classList.add('live');
       metaEl.textContent = `运行状态 · 更新于 ${new Date().toLocaleTimeString()}`;
@@ -314,8 +319,11 @@ function restartTimer() {
 }
 
 logEl.addEventListener('scroll', () => {
-  const nearBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60;
-  state.stick = nearBottom;
+  if (state.desc) {
+    state.stick = logEl.scrollTop < 60;
+  } else {
+    state.stick = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60;
+  }
 });
 document.getElementById('grep').addEventListener('input', load);
 document.getElementById('lines').addEventListener('change', load);
@@ -324,6 +332,14 @@ document.getElementById('wrap').onclick = () => {
   state.wrap = !state.wrap;
   logEl.classList.toggle('nowrap', !state.wrap);
 };
+document.getElementById('order').onclick = () => {
+  state.desc = !state.desc;
+  state.stick = true;
+  document.getElementById('order').textContent = state.desc ? '倒序' : '正序';
+  try { localStorage.setItem('lv_order', state.desc ? 'desc' : 'asc'); } catch (e) { /* 忽略 */ }
+  load();
+};
+document.getElementById('order').textContent = state.desc ? '倒序' : '正序';
 document.getElementById('copy').onclick = async () => {
   await navigator.clipboard.writeText(logEl.innerText);
   metaEl.textContent = '已复制当前视图到剪贴板';
