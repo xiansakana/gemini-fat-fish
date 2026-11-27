@@ -861,8 +861,12 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     text, at_self, reply_id, images = parse_message(event.get("message"))
     if images:
         text = (text + " [对方发了图片]").strip()
+    silent_ping = not text and (at_self or is_reply_to_bot(reply_id))
     if not text:
-        return {"ok": False, "reason": "空消息"}
+        if silent_ping:
+            text = "（只是叫了你一下，没说话）"
+        else:
+            return {"ok": False, "reason": "空消息"}
 
     group = message_type == "group"
     group_id = str(event.get("group_id", ""))
@@ -915,7 +919,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         return {"ok": False, "reason": "今日预算用完"}
 
     prompt = f"{speaker}：{text}" if group else text
-    if group and len(text) <= 6:
+    if group and (silent_ping or len(text) <= 6):
         earlier = build_group_context(group_id)
         if earlier:
             prompt = (
