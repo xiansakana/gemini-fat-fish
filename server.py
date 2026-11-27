@@ -7,10 +7,12 @@ API Key 只保存在服务端 .env，浏览器侧看不到。
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -103,6 +105,11 @@ DEFAULTS = {
     "QQ_CONTEXT_PROBE_GAP": "12",
     # 群聊回复时随消息附一张表情差分的概率
     "QQ_STICKER_RATE": "0.08",
+    # 图片 / 视频理解：被直接叫到时才把媒体送进模型
+    "QQ_VISION": "1",
+    "QQ_VISION_MAX_IMAGES": "3",
+    "QQ_VISION_VIDEO_MB": "20",
+    "QQ_VISION_VIDEO_SECONDS": "45",
     # 群事件（撤回/入群/退群）回应概率与最短间隔
     "QQ_NOTICE_RATE": "0.5",
     "QQ_NOTICE_GAP": "60",
@@ -444,9 +451,174 @@ def gemini_post(
     return None, last_error
 
 
+def _sniff_mime(data: bytes) -> str:
+    head = data[:16]
+    if head.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG"):
+        return "image/png"
+    if head.startswith(b"GIF8"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[4:8] == b"ftyp":
+        return "video/mp4"
+    if head.startswith(b"\x1aE\xdf\xa3"):
+        return "video/webm"
+    return "application/octet-stream"
+
+
+def fetch_media(item: dict, max_mb: int) -> tuple[bytes, str] | None:
+    """按 url 或本地 path 取一段媒体，超限直接放弃，避免拖垮请求。"""
+    limit = max(1, int(max_mb)) * 1024 * 1024
+    data = b""
+    try:
+        path = str(item.get("path") or "")
+        url = str(item.get("url") or "")
+        if path and Path(path).exists():
+            data = Path(path).read_bytes()[: limit + 1]
+        elif url.startswith(("http://", "https://")):
+            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(request, timeout=25) as response:
+                data = response.read(limit + 1)
+        else:
+            return None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[媒体] 取不到 {item.get('url', '')[:80]} | {type(exc).__name__} {exc}", flush=True)
+        return None
+    if not data or len(data) > limit:
+        print(f"[媒体] 超限或为空：{len(data)} 字节", flush=True)
+        return None
+    mime = str(item.get("mime") or "") or _sniff_mime(data)
+    if mime == "application/octet-stream":
+        return None
+    return data, mime
+
+
+def _ffmpeg_run(args: list[str], timeout: int = 90) -> bool:
+    try:
+        done = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", *args],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        return done.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _image_part(data: bytes, mime: str) -> dict | None:
+    """图片统一压到 1280 以内再发，省 token 也避开请求体上限。"""
+    if len(data) <= 1_500_000:
+        return {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "in.img"
+        dst = Path(tmp) / "out.jpg"
+        src.write_bytes(data)
+        if not _ffmpeg_run(["-i", str(src), "-vf", "scale='min(1280,iw)':-2", "-q:v", "4", str(dst)]):
+            return None
+        small = dst.read_bytes()
+    if len(small) > 4_000_000:
+        return None
+    return {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(small).decode()}}
+
+
+def _video_duration(path: Path) -> float:
+    try:
+        done = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, timeout=20, check=False,
+        )
+        return float(done.stdout.decode().strip() or 0)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
+def _video_parts(data: bytes, mime: str, limit_mb: int, max_seconds: int) -> tuple[list[dict], str]:
+    """视频直接当多模态输入；太大或太长就压缩，仍不行再退回抽帧。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "in.mp4"
+        src.write_bytes(data)
+        duration = _video_duration(src)
+        need_compress = len(data) > 12 * 1024 * 1024 or (max_seconds and duration > max_seconds)
+        if need_compress:
+            dst = Path(tmp) / "out.mp4"
+            args = ["-i", str(src)]
+            if max_seconds:
+                args += ["-t", str(int(max_seconds))]
+            args += [
+                "-vf", "scale=-2:480", "-c:v", "libx264", "-crf", "30", "-preset", "veryfast",
+                "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(dst),
+            ]
+            if _ffmpeg_run(args) and dst.exists() and dst.stat().st_size <= limit_mb * 1024 * 1024:
+                small = dst.read_bytes()
+                note = f"（视频约 {duration:.0f} 秒，已压缩）" if duration else "（视频已压缩）"
+                return [{"inline_data": {"mime_type": "video/mp4", "data": base64.b64encode(small).decode()}}], note
+
+        frames: list[dict] = []
+        step = max(1.0, (duration or 10) / 6)
+        pattern = str(Path(tmp) / "f%02d.jpg")
+        if _ffmpeg_run(["-i", str(src), "-vf", f"fps=1/{step:.2f},scale=640:-2", "-frames:v", "6", pattern]):
+            for frame in sorted(Path(tmp).glob("f*.jpg")):
+                frames.append(
+                    {"inline_data": {"mime_type": "image/jpeg",
+                                     "data": base64.b64encode(frame.read_bytes()).decode()}}
+                )
+        if frames:
+            note = f"（视频约 {duration:.0f} 秒，按 {step:.1f} 秒抽了 {len(frames)} 帧）" if duration else f"（视频抽了 {len(frames)} 帧）"
+            return frames, note
+    return [], ""
+
+
+def prepare_media(media: list[dict], max_images: int = 3, video_mb: int = 20, video_seconds: int = 45) -> tuple[list[dict], str]:
+    """把桥传来的图片 / 视频整理成 Gemini 的 inline_data 片段。"""
+    parts: list[dict] = []
+    images = 0
+    videos = 0
+    notes: list[str] = []
+    for item in media or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "image")
+        if kind == "image":
+            if images >= max_images:
+                continue
+            got = fetch_media(item, 6)
+            if not got:
+                continue
+            part = _image_part(*got)
+            if part:
+                parts.append(part)
+                images += 1
+        elif kind == "video":
+            if videos >= 1:
+                continue
+            got = fetch_media(item, video_mb)
+            if not got:
+                continue
+            video_parts, note = _video_parts(got[0], got[1], 12, video_seconds)
+            if video_parts:
+                parts.extend(video_parts)
+                videos += 1
+                if note:
+                    notes.append(note)
+    summary = ""
+    if images or videos:
+        bits = []
+        if images:
+            bits.append(f"{images} 张图片")
+        if videos:
+            bits.append(f"{videos} 段视频")
+        summary = "（对方发了 " + "、".join(bits) + "".join(notes) + "）"
+    return parts, summary
+
+
 def call_gemini(
     mem: dict, message: str, channel: str = "web", speaker: str = "",
     profile: str = "", persona_override: str = "", context: str = "",
+    media: list[dict] | None = None,
 ) -> tuple[str, dict, str | None, list[dict]]:
     api_key = CFG["GEMINI_API_KEY"]
     if not api_key:
@@ -467,7 +639,21 @@ def call_gemini(
         text = str(turn.get("text", ""))[:2000]
         if text:
             contents.append({"role": role, "parts": [{"text": text}]})
-    contents.append({"role": "user", "parts": [{"text": message}]})
+    media_parts, media_note = prepare_media(
+        media or [],
+        max_images=int(CFG.get("QQ_VISION_MAX_IMAGES") or 3),
+        video_mb=int(CFG.get("QQ_VISION_VIDEO_MB") or 20),
+        video_seconds=int(CFG.get("QQ_VISION_VIDEO_SECONDS") or 45),
+    )
+    if media_parts:
+        user_parts = list(media_parts)
+        if media_note:
+            user_parts.append({"text": media_note})
+        user_parts.append({"text": message})
+        print(f"[媒体] {media_note} | 片段 {len(media_parts)}", flush=True)
+        contents.append({"role": "user", "parts": user_parts})
+    else:
+        contents.append({"role": "user", "parts": [{"text": message}]})
 
     generation_config = {"maxOutputTokens": max_tokens}
     if CFG["THINKING_LEVEL"] and not group:
@@ -1284,6 +1470,17 @@ class Handler(BaseHTTPRequestHandler):
             profile = str(body.get("profile") or "").strip()[:1200]
             persona_override = str(body.get("persona_override") or "").strip()[:4000]
             context = str(body.get("context") or "").strip()[:1600]
+            incoming_media = body.get("media") or []
+            media = [
+                {
+                    "type": str(item.get("type") or "image"),
+                    "url": str(item.get("url") or "")[:2000],
+                    "path": str(item.get("path") or "")[:500],
+                    "mime": str(item.get("mime") or "")[:60],
+                }
+                for item in incoming_media
+                if isinstance(item, dict)
+            ][:6] if CFG.get("QQ_VISION", "1").lower() not in ("0", "false", "no", "off") else []
             mem = load_memory(session)
 
             if path == "/api/remember":
@@ -1344,7 +1541,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             reply, usage, error, tool_events = call_gemini(
-                mem, message, channel, speaker, profile, persona_override, context
+                mem, message, channel, speaker, profile, persona_override, context, media
             )
             reply_to_user = reply
             reflection_usage = {}

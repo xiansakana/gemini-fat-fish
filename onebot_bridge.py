@@ -220,6 +220,33 @@ def join_greet_enabled() -> bool:
     return cfg("QQ_JOIN_GREET", "1").lower() not in ("0", "false", "no", "off")
 
 
+def vision_enabled() -> bool:
+    """被直接叫到时，把图片 / 视频也一起送进模型。"""
+    return cfg("QQ_VISION", "1").lower() not in ("0", "false", "no", "off")
+
+
+def collect_media(attachments: list[dict]) -> list[dict]:
+    """挑出模型能直接读的媒体，限制数量，缺 url 的用 get_image 补一次。"""
+    media: list[dict] = []
+    images = 0
+    videos = 0
+    for item in attachments or []:
+        kind = item.get("type")
+        url = str(item.get("url") or "")
+        if not url and kind == "image" and item.get("file"):
+            result = onebot_call("get_image", {"file": item["file"]}) or {}
+            url = str(((result.get("data") or {}).get("url")) or "")
+        if not url:
+            continue
+        if kind == "image" and images < 3:
+            media.append({"type": "image", "url": url})
+            images += 1
+        elif kind == "video" and videos < 1:
+            media.append({"type": "video", "url": url})
+            videos += 1
+    return media
+
+
 def is_dry() -> bool:
     return bool(getattr(_force_dry, "value", False)) or not bool(onebot_api())
 
@@ -954,16 +981,17 @@ def is_reply_to_bot(reply_id) -> bool:
     return str(reply_id) in _bot_message_ids
 
 
-def parse_message(message) -> tuple[str, bool, str | None, int]:
-    """返回（文本，是否@机器人，引用的消息 id，图片数量）。"""
+def parse_message(message) -> tuple[str, bool, str | None, int, list[dict]]:
+    """返回（文本，是否@机器人，引用的消息 id，图片数量，图片/视频段）。"""
     if isinstance(message, str):
         at_self = "[CQ:at,qq=" in message and cfg("QQ_BOT_QQ") and f"[CQ:at,qq={cfg('QQ_BOT_QQ')}]" in message
         reply_match = re.search(r"\[CQ:reply,id=(-?\d+)\]", message)
         images = len(re.findall(r"\[CQ:image,", message))
         text = re.sub(r"\[CQ:[^\]]+\]", " ", message)
-        return re.sub(r"\s+", " ", text).strip(), at_self, reply_match.group(1) if reply_match else None, images
+        return re.sub(r"\s+", " ", text).strip(), at_self, reply_match.group(1) if reply_match else None, images, []
 
     text_parts: list[str] = []
+    attachments: list[dict] = []
     at_self = False
     reply_id = None
     images = 0
@@ -986,10 +1014,28 @@ def parse_message(message) -> tuple[str, bool, str | None, int]:
         elif kind in ("image", "mface"):
             images += 1
             text_parts.append("[图片] ")
+            attachments.append(
+                {
+                    "type": "image",
+                    "url": str(data.get("url") or ""),
+                    "file": str(data.get("file") or ""),
+                    "size": str(data.get("file_size") or data.get("size") or ""),
+                }
+            )
+        elif kind == "video":
+            text_parts.append("[视频] ")
+            attachments.append(
+                {
+                    "type": "video",
+                    "url": str(data.get("url") or ""),
+                    "file": str(data.get("file") or ""),
+                    "size": str(data.get("file_size") or data.get("size") or ""),
+                }
+            )
         elif kind == "face":
             text_parts.append("[表情] ")
     text = re.sub(r"\s+", " ", "".join(text_parts)).strip()
-    return text, at_self, reply_id, images
+    return text, at_self, reply_id, images, attachments
 
 
 def display_name(event: dict) -> str:
@@ -1057,12 +1103,14 @@ def split_reply(text: str, limit: int = 2) -> list[str]:
 def ask_core(
     text: str, session: str, channel: str, speaker: str,
     profile: str = "", persona_override: str = "", context: str = "",
+    media: list[dict] | None = None,
 ) -> tuple[str, str | None]:
     payload = json.dumps(
         {
             "message": text, "session": session, "channel": channel,
             "speaker": speaker, "profile": profile,
             "persona_override": persona_override, "context": context,
+            "media": media or [],
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -1381,9 +1429,12 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     if message_type not in ("group", "private"):
         return {"ok": False, "reason": "未知消息类型"}
 
-    text, at_self, reply_id, images = parse_message(event.get("message"))
+    text, at_self, reply_id, images, attachments = parse_message(event.get("message"))
+    video_count = sum(1 for item in attachments if item.get("type") == "video")
     if images:
         text = (text + " [对方发了图片]").strip()
+    if video_count:
+        text = (text + " [对方发了视频]").strip()
     silent_ping = not text and (at_self or is_reply_to_bot(reply_id))
     if not text:
         if silent_ping:
@@ -1465,10 +1516,14 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         profile_context = (profile_context + "\n" + slang).strip()
     persona = group_persona(group_id) if group else ""
     group_context = build_group_context(group_id) if group else ""
+    media = collect_media(attachments) if group and vision_enabled() else []
+    if media:
+        log_line(f"[媒体] {group_id} | 图 {sum(1 for m in media if m['type'] == 'image')} "
+                 f"视频 {sum(1 for m in media if m['type'] == 'video')}")
     with _reply_lock:
         reply, error = ask_core(
             prompt, session, channel, speaker,
-            profile_context, persona, group_context,
+            profile_context, persona, group_context, media,
         )
 
     if error or not reply:
@@ -1481,7 +1536,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         with _reply_lock:
             retry, retry_error = ask_core(
                 retry_prompt, session, channel, speaker,
-                profile_context, persona, group_context,
+                profile_context, persona, group_context, media,
             )
         if retry and not retry_error:
             reply = retry
