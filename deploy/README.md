@@ -21,6 +21,23 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now gemini-fish-logview
 ```
 
+### 443 端口复用（sslh）
+
+GCP 防火墙只放行 `21/22/443`，而 21/22 会被浏览器拦，所以日志页走 443，用 sslh 按协议分流：
+
+```
+                       ┌─ TLS（VLESS Reality）→ 127.0.0.1:8443  sing-box
+公网 443 → sslh ───────┤
+                       └─ 明文 HTTP          → 127.0.0.1:8770  logview
+```
+
+- `/etc/default/sslh`：`DAEMON_OPTS="-p 0.0.0.0:443 --tls 127.0.0.1:8443 --http 127.0.0.1:8770 -t 5 -P /run/sslh.pid -u sslh"`
+- sing-box 的 `private-reality` 入站改成 `listen: 127.0.0.1`、`listen_port: 8443`（原配置备份在 `/etc/sing-box/config.json.bak-*`）
+- 验证方式：`curl http://<IP>:443/healthz` 应返回 200；`openssl s_client -connect <IP>:443 -servername www.microsoft.com` 应返回真实的 `www.microsoft.com` 证书，说明代理链路没被破坏
+- 回滚：恢复 sing-box 配置 → `systemctl restart sing-box` → `systemctl disable --now sslh`
+
+注意：日志页只能走 **http://**，写成 https:// 会被 sing-box 接走。
+
 `.env` 里必须设置 `LOGVIEW_TOKEN`（`openssl rand -hex 12`），否则服务拒绝启动。访问地址：
 
 ```
