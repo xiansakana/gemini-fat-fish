@@ -353,10 +353,12 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         if index:
             time.sleep(0.8)
         if group:
-            ok = call_onebot(
-                "send_group_msg",
-                {"group_id": int(group_id), "message": segments},
-            )
+            payload = {"group_id": int(group_id), "message": segments}
+            ok = call_onebot("send_group_msg", payload)
+            if not ok and any(seg.get("type") == "at" for seg in segments):
+                # @ 的号可能不是群成员，NapCat 拿不到 Uid，去掉 @ 重发
+                fallback = [seg for seg in segments if seg.get("type") != "at"]
+                ok = call_onebot("send_group_msg", {"group_id": int(group_id), "message": fallback})
         else:
             ok = call_onebot(
                 "send_private_msg",
