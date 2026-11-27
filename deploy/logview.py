@@ -11,6 +11,7 @@ import glob
 import hmac
 import json
 import os
+import re
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,7 +60,8 @@ def tail_file(path: str, want: int) -> list[str]:
                 data = handle.read(step) + data
     except OSError:
         return []
-    return data.decode("utf-8", "replace").splitlines()[-want:]
+    lines = data.decode("utf-8", "replace").splitlines()
+    return [ANSI_RE.sub("", line) for line in lines][-want:]
 
 
 def tail_many(paths: list[str], want: int) -> list[str]:
@@ -71,13 +73,17 @@ def tail_many(paths: list[str], want: int) -> list[str]:
     return lines[-want:]
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
 def run(cmd: list[str], timeout: int = 15) -> list[str]:
     try:
         done = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return []
     text = b"\n".join(part for part in (done.stdout, done.stderr) if part)
-    return text.decode("utf-8", "replace").splitlines()
+    raw = text.decode("utf-8", "replace")
+    return [ANSI_RE.sub("", line) for line in raw.splitlines()]
 
 
 def bridge_log_files() -> list[str]:
