@@ -1600,8 +1600,9 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         )
         update_profile(group_id, user_id, speaker, text, time.time())
         maybe_remember_group(group_id)
-        # 第一次见到这个群（比如刚被拉进来）：后台补历史 + 读群资料
-        if group_id not in _backfilled and group_allowed(group_id):
+        # 第一次见到这个群，或距上次补历史超过六小时：后台补历史 + 读群资料
+        done_at = float(_backfilled.get(group_id, 0.0))
+        if group_allowed(group_id) and (not done_at or time.time() - done_at > 6 * 3600):
             threading.Thread(target=backfill_group, args=(group_id,), daemon=True).start()
 
     if group and auto_whitelist() and not group_allowed(group_id) and str(event.get("user_id")) != cfg("QQ_BOT_QQ"):
