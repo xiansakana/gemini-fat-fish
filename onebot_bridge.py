@@ -476,6 +476,11 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
 
     group = message_type == "group"
     group_id = str(event.get("group_id", ""))
+    if group:
+        log_line(
+            f"[入站] {group_id} | {display_name(event)} | {text[:60]} | "
+            f"at={at_self} reply={reply_id}"
+        )
     # 不回复也记下来，观察循环要靠这些上下文判断气氛
     if group and group_id and str(event.get("user_id")) != cfg("QQ_BOT_QQ"):
         record_group_message(group_id, display_name(event), text)
@@ -483,6 +488,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     reply_to_bot = is_reply_to_bot(reply_id)
     engage, reason = should_engage(event, text, at_self, reply_to_bot)
     if not engage:
+        log_line(f"[跳过] {group_id} | {reason}")
         return {"ok": False, "reason": reason}
 
     user_id = event.get("user_id")
@@ -500,6 +506,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
                 # 被直接叫到时不吞消息，等完很短的间隔再回
                 time.sleep(min(limit - elapsed, 10))
             else:
+                log_line(f"[跳过] {group_id} | 冷却中")
                 return {"ok": False, "reason": "冷却中"}
     if group and event.get("message_id") is not None:
         reply_id = str(event.get("message_id"))
@@ -651,10 +658,27 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self) -> dict:
+        raw = b""
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            return json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, TypeError):
+            if "chunked" in str(self.headers.get("Transfer-Encoding", "")).lower():
+                while True:
+                    line = self.rfile.readline().strip()
+                    size = int(line.split(b";")[0], 16)
+                    if size == 0:
+                        self.rfile.readline()
+                        break
+                    raw += self.rfile.read(size)
+                    self.rfile.read(2)
+            else:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 0:
+                    raw = self.rfile.read(length)
+            if not raw:
+                return {}
+            value = json.loads(raw)
+            return value if isinstance(value, dict) else {}
+        except Exception as exc:  # noqa: BLE001
+            log_line(f"上报解析失败 {type(exc).__name__} {exc} | {raw[:300]!r}")
             return {}
 
     def do_GET(self) -> None:  # noqa: N802
