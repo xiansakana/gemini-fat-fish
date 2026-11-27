@@ -1793,6 +1793,16 @@ class Handler(BaseHTTPRequestHandler):
                 segments.append(
                     {"type": "reply", "data": {"id": str(body["reply_id"])}}
                 )
+            if body.get("at") and cfg("QQ_BOT_QQ"):
+                segments.append({"type": "at", "data": {"qq": cfg("QQ_BOT_QQ")}})
+            for url in (body.get("image_urls") or []):
+                segments.append(
+                    {"type": "image", "data": {"url": str(url), "file": "test.png"}}
+                )
+            if body.get("video_url"):
+                segments.append(
+                    {"type": "video", "data": {"url": str(body["video_url"]), "file": "test.mp4"}}
+                )
             segments.append(
                 {"type": "text", "data": {"text": body.get("text", "")}}
             )
