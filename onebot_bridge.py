@@ -409,9 +409,10 @@ def dynamic_threshold(group_id: str) -> int:
     recent = [item for item in _group_buffer.get(group_id, [])
               if now - float(item.get("ts", 0)) < 600]
     rate = len(recent) / 10.0  # 每分钟消息数
-    if rate >= 8:
+    dynamic = cfg("QQ_THRESHOLD_DYNAMIC", "1").lower() not in ("0", "false", "no", "off")
+    if dynamic and rate >= 8:
         base += 1
-    elif rate <= 1.5:
+    elif dynamic and rate <= 1.5:
         base -= 1
     value = get_talk_value(group_id)
     if value:
