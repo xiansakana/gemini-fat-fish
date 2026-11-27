@@ -39,6 +39,8 @@ TALK_VALUE_FILE = DATA_DIR / "qq_talk_value.json"
 PROFILE_FILE = DATA_DIR / "qq_profiles.json"
 PERSONA_FILE = DATA_DIR / "qq_personas.json"
 SLANG_FILE = DATA_DIR / "qq_slang.json"
+INTRO_FILE = DATA_DIR / "qq_group_intro.json"
+BACKFILL_FILE = DATA_DIR / "qq_backfill.json"
 
 CORE_TIMEOUT = 90
 _reply_lock = threading.Lock()
@@ -56,6 +58,8 @@ _group_last_notice: dict[str, float] = {}
 _group_buffer: dict[str, list[dict]] = {}
 _group_cursor: dict[str, int] = {}
 _group_seq: dict[str, int] = {}
+_group_warmup: dict[str, float] = {}
+_backfilled: dict[str, float] = {}
 _bot_message_ids: list[str] = []
 OBSERVE_BUDGET_FILE = DATA_DIR / "qq_observe_budget.json"
 
@@ -71,6 +75,20 @@ def parse_list(key: str) -> list[str]:
 
 def group_whitelist() -> set[str]:
     return set(parse_list("QQ_GROUP_WHITELIST"))
+
+
+def group_allowed(group_id: str) -> bool:
+    """白名单填 * 表示任何群都生效（新拉的群不用改配置）。"""
+    allowed = group_whitelist()
+    return "*" in allowed or str(group_id) in allowed
+
+
+def known_groups() -> set[str]:
+    """白名单填 * 时没有固定群号，用实际见过的群代替。"""
+    whitelist = {gid for gid in group_whitelist() if gid != "*"}
+    if "*" not in group_whitelist():
+        return whitelist
+    return whitelist | set(_group_buffer) | set(load_json(INTRO_FILE, {}) or {})
 
 
 def private_whitelist() -> set[str]:
@@ -177,6 +195,21 @@ def observe_daily_calls() -> int:
     return _int_cfg("QQ_OBSERVE_DAILY_CALLS", 200, 0, 10000)
 
 
+def backfill_count() -> int:
+    """进群或第一次见到某个群时，最多往回翻多少条历史消息。"""
+    return _int_cfg("QQ_BACKFILL_COUNT", 200, 0, 1000)
+
+
+def buffer_max() -> int:
+    """每群保留多少条消息当上下文，太大会占内存，但回填要靠它留住。"""
+    return _int_cfg("QQ_BUFFER_MAX", 240, 60, 2000)
+
+
+def group_warmup() -> float:
+    """刚进群这段时间只潜水，不主动插话（秒）。"""
+    return _float_cfg("QQ_GROUP_WARMUP", 300, 0, 86400)
+
+
 def is_dry() -> bool:
     return bool(getattr(_force_dry, "value", False)) or not bool(onebot_api())
 
@@ -248,7 +281,9 @@ def observe_budget_ok(consume: bool = True) -> bool:
     return True
 
 
-def record_group_message(group_id: str, speaker: str, text: str, ts: float | None = None) -> None:
+def record_group_message(
+    group_id: str, speaker: str, text: str, ts: float | None = None, msg_id: str = ""
+) -> None:
     """每条群消息都进缓冲区，不回复也记，供之后判断上下文。"""
     if not text.strip() or not group_id:
         return
@@ -262,9 +297,10 @@ def record_group_message(group_id: str, speaker: str, text: str, ts: float | Non
                 "ts": float(ts or time.time()),
                 "speaker": str(speaker)[:20],
                 "text": str(text)[:300],
+                "msg_id": str(msg_id or ""),
             }
         )
-        del buffer[: -max(observe_window() * 3, 60)]
+        del buffer[: -max(observe_window() * 3, 60, buffer_max())]
 
 
 def pending_messages(group_id: str) -> list[dict]:
@@ -533,8 +569,240 @@ def build_group_context(group_id: str) -> str:
     return "\n".join(lines)
 
 
-def ask_observe(messages: list[dict], probe: str = "") -> dict:
-    payload = json.dumps({"messages": messages, "probe": probe}, ensure_ascii=False).encode("utf-8")
+def _history_message(raw: dict) -> tuple[str, str, str, str]:
+    """从 OneBot 历史消息里取出 (昵称, 文本, QQ号, 消息id)。"""
+    sender = raw.get("sender") or {}
+    name = str(
+        sender.get("card") or sender.get("nickname") or raw.get("user_id") or "群友"
+    )[:20]
+    chunks: list[str] = []
+    for seg in (raw.get("message") or []):
+        if not isinstance(seg, dict):
+            continue
+        seg_type = seg.get("type")
+        data = seg.get("data") or {}
+        if seg_type == "text":
+            chunks.append(str(data.get("text") or ""))
+        elif seg_type == "at":
+            qq = str(data.get("qq") or "")
+            chunks.append("@全体" if qq == "all" else ("@" + qq if qq else ""))
+        elif seg_type == "image":
+            chunks.append("[图片]")
+    text = " ".join(part.strip() for part in chunks if part and part.strip())
+    return name, text[:300], str(raw.get("user_id") or ""), str(raw.get("message_id") or "")
+
+
+def fetch_group_history(group_id: str, limit: int | None = None) -> list[dict]:
+    """尽量往回翻群历史。OneBot 一页只给 30 条，得用 message_seq 倒着取。"""
+    want = min(limit if limit is not None else backfill_count(), 1000)
+    if want <= 0:
+        return []
+    gid = int(group_id) if str(group_id).isdigit() else group_id
+    collected: dict[str, dict] = {}
+    seq: int | None = None
+    for _ in range(40):
+        payload: dict = {"group_id": gid, "count": 30}
+        if seq is not None:
+            payload["message_seq"] = seq
+            payload["reverseOrder"] = True
+        result = onebot_call("get_group_msg_history", payload)
+        if not result:
+            break
+        messages = ((result.get("data") or {}).get("messages") or [])
+        if not messages:
+            break
+        fresh = 0
+        for raw in messages:
+            if not isinstance(raw, dict):
+                continue
+            key = str(raw.get("message_id") or raw.get("message_seq") or "")
+            if not key or key in collected:
+                continue
+            collected[key] = raw
+            fresh += 1
+        seqs = [
+            int(item["message_seq"]) for item in messages
+            if isinstance(item, dict) and item.get("message_seq") is not None
+        ]
+        if not seqs or fresh == 0 or len(collected) >= want:
+            break
+        seq = min(seqs)
+    ordered = sorted(collected.values(), key=lambda item: float(item.get("time") or 0))
+    return ordered[-want:]
+
+
+def _sample_messages(items: list[dict], wanted: int = 24) -> list[dict]:
+    """摘要只要抓重点，均匀取样比只取最后几条更能覆盖整段历史。"""
+    picked: list[dict] = []
+    for raw in items:
+        name, text, uid, _ = _history_message(raw)
+        if text and uid != cfg("QQ_BOT_QQ"):
+            picked.append({"speaker": name, "text": text})
+    if len(picked) <= wanted:
+        return picked
+    step = len(picked) / wanted
+    return [picked[int(index * step)] for index in range(wanted)]
+
+
+def seed_profiles(group_id: str, items: list[dict]) -> int:
+    """回填时一次给几个主要说话人建画像，比逐条触发省调用。"""
+    by_user: dict[str, list[dict]] = {}
+    names: dict[str, str] = {}
+    for raw in items:
+        name, text, uid, _ = _history_message(raw)
+        if not text or not uid or uid == cfg("QQ_BOT_QQ"):
+            continue
+        by_user.setdefault(uid, []).append({"text": text})
+        names[uid] = name
+    targets = sorted(by_user.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]
+    data = load_json(PROFILE_FILE, {})
+    added = 0
+    for uid, messages in targets:
+        if len(messages) < 4 or not observe_budget_ok():
+            continue
+        facts = ask_profile(messages[-12:])
+        if not facts:
+            continue
+        key = profile_key(group_id, uid)
+        entry = dict(data.get(key) or {})
+        entry["nickname"] = names.get(uid) or entry.get("nickname") or str(uid)
+        entry["messages"] = max(int(entry.get("messages", 0)), len(messages))
+        entry["last"] = time.time()
+        stored = [x for x in (entry.get("facts") or []) if isinstance(x, dict)]
+        for fact in facts:
+            if any(_similar(str(x.get("text")), fact) for x in stored):
+                continue
+            stored.append({"text": fact, "ts": time.time(), "weight": 1.0})
+            added += 1
+        entry["facts"] = stored[-15:]
+        data[key] = entry
+    if added:
+        save_json(PROFILE_FILE, data)
+    return added
+
+
+def refresh_group_intro(group_id: str) -> dict:
+    """读群名、群公告、成员，给她一份「这是哪个群」的底稿。"""
+    gid = int(group_id) if str(group_id).isdigit() else group_id
+    info = ((onebot_call("get_group_info", {"group_id": gid, "no_cache": True}) or {}).get("data") or {})
+    raw_members = (onebot_call("get_group_member_list", {"group_id": gid, "no_cache": True}) or {}).get("data") or []
+    members: list[dict] = []
+    for item in raw_members if isinstance(raw_members, list) else []:
+        name = str(item.get("card") or item.get("nickname") or item.get("user_id") or "")[:20]
+        if not name:
+            continue
+        members.append({"name": name, "role": str(item.get("role") or "member")})
+    owner = next((m["name"] for m in members if m["role"] == "owner"), "")
+    admins = [m["name"] for m in members if m["role"] == "admin"][:4]
+    entry = {
+        "group_id": str(group_id),
+        "name": str(info.get("group_name") or ""),
+        "notice": str(info.get("group_memo") or info.get("group_notice") or "")[:300],
+        "count": len(members) or int(info.get("member_count") or 0),
+        "created": int(info.get("group_create_time") or 0),
+        "owner": owner,
+        "admins": admins,
+        "members": [m["name"] for m in members[:20]],
+        "ts": time.time(),
+    }
+    data = load_json(INTRO_FILE, {})
+    data[str(group_id)] = entry
+    save_json(INTRO_FILE, data)
+    return entry
+
+
+def intro_context(group_id: str) -> str:
+    entry = (load_json(INTRO_FILE, {}) or {}).get(str(group_id)) or {}
+    if not entry:
+        return ""
+    head = (
+        f"【这个群】{entry.get('name') or '未命名'}"
+        f"（群号 {group_id}，{entry.get('count') or '?'} 人"
+    )
+    created = int(entry.get("created") or 0)
+    if created:
+        head += f"，建于 {time.strftime('%Y-%m-%d', time.localtime(created))}"
+    head += "）"
+    lines = [head]
+    if entry.get("notice"):
+        lines.append("【群公告】" + str(entry["notice"]))
+    people = []
+    if entry.get("owner"):
+        people.append("群主 " + str(entry["owner"]))
+    if entry.get("admins"):
+        people.append("管理 " + "、".join(str(x) for x in entry["admins"]))
+    if entry.get("members"):
+        people.append("常客 " + "、".join(str(x) for x in entry["members"][:10]))
+    if people:
+        lines.append("【群里的人】" + "；".join(people))
+    return "\n".join(lines)
+
+
+def backfill_group(group_id: str, limit: int | None = None, force: bool = False) -> dict:
+    """进群或第一次见到某个群时，把能拿到的历史灌进上下文、画像和摘要。"""
+    group_id = str(group_id)
+    now = time.time()
+    with _observe_lock:
+        done_at = float(_backfilled.get(group_id, 0.0))
+        if done_at and not force and now - done_at < 6 * 3600:
+            return {"ok": False, "reason": "六小时内补过", "group_id": group_id}
+        _backfilled[group_id] = now
+        _group_warmup[group_id] = now + group_warmup()
+    save_json(BACKFILL_FILE, {gid: int(ts) for gid, ts in _backfilled.items()})
+
+    intro = refresh_group_intro(group_id)
+    items = fetch_group_history(group_id, limit)
+    added = 0
+    if items:
+        known = {
+            (str(item.get("speaker")), str(item.get("text")))
+            for item in _group_buffer.get(group_id, [])
+        }
+        bot_qq = cfg("QQ_BOT_QQ")
+        for raw in items:
+            name, text, uid, msg_id = _history_message(raw)
+            if not text or (bot_qq and uid == bot_qq):
+                continue
+            if (name, text) in known:
+                continue
+            record_group_message(
+                group_id, name, text, float(raw.get("time") or time.time()), msg_id
+            )
+            known.add((name, text))
+            added += 1
+        if added:
+            with _observe_lock:
+                buffer = _group_buffer.get(group_id, [])
+                buffer.sort(key=lambda item: float(item.get("ts") or 0))
+                for index, item in enumerate(buffer, start=1):
+                    item["seq"] = index
+                _group_seq[group_id] = len(buffer)
+                _group_cursor[group_id] = len(buffer)
+            facts = seed_profiles(group_id, items)
+            sample = _sample_messages(items)
+            if len(sample) >= 8 and observe_budget_ok():
+                summary = ask_summary(f"group_{group_id}", sample)
+                if summary:
+                    log_line(f"[回填摘要] {group_id} | {summary[:80]}")
+            log_line(f"[回填画像] {group_id} | 新增 {facts} 条事实")
+    log_line(
+        f"[回填] {group_id} | {intro.get('name') or '未知群'} | "
+        f"取到 {len(items)} 条，入上下文 {added} 条"
+    )
+    return {
+        "ok": True,
+        "group_id": group_id,
+        "name": intro.get("name"),
+        "fetched": len(items),
+        "added": added,
+        "warmup": int(group_warmup()),
+    }
+
+
+def ask_observe(messages: list[dict], probe: str = "", intro: str = "") -> dict:
+    payload = json.dumps(
+        {"messages": messages, "probe": probe, "intro": intro}, ensure_ascii=False
+    ).encode("utf-8")
     request = urllib.request.Request(
         core_url() + "/api/observe",
         data=payload,
@@ -767,12 +1035,11 @@ def ask_core(
     return str(data.get("reply") or ""), data.get("error")
 
 
-def call_onebot(action: str, payload: dict) -> tuple[bool, str | None]:
-    """返回 (是否成功, OneBot 返回的 message_id)。"""
+def onebot_call(action: str, payload: dict) -> dict | None:
+    """调 OneBot 接口并返回原始响应，失败返回 None。查询类接口要用它。"""
     api = onebot_api()
-    if is_dry():
-        print(f"[干跑] {action} {json.dumps(payload, ensure_ascii=False)[:300]}", flush=True)
-        return True, None
+    if not api:
+        return None
     request = urllib.request.Request(
         f"{api}/{action}",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -780,20 +1047,30 @@ def call_onebot(action: str, payload: dict) -> tuple[bool, str | None]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             result = json.load(response)
-        if isinstance(result, dict) and result.get("retcode") not in (0, None):
-            log_line(f"发送失败 {action}: {result}")
-            return False, None
-        message_id = None
-        if isinstance(result, dict):
-            data = result.get("data") or {}
-            if isinstance(data, dict) and data.get("message_id") is not None:
-                message_id = str(data["message_id"])
-        return True, message_id
     except Exception as exc:  # noqa: BLE001
-        log_line(f"发送异常 {action}: {type(exc).__name__} {exc}")
+        log_line(f"调用失败 {action}: {type(exc).__name__} {exc}")
+        return None
+    if isinstance(result, dict) and result.get("retcode") not in (0, None):
+        log_line(f"调用失败 {action}: {result}")
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def call_onebot(action: str, payload: dict) -> tuple[bool, str | None]:
+    """返回 (是否成功, OneBot 返回的 message_id)。"""
+    if is_dry():
+        print(f"[干跑] {action} {json.dumps(payload, ensure_ascii=False)[:300]}", flush=True)
+        return True, None
+    result = onebot_call(action, payload)
+    if result is None:
         return False, None
+    data = result.get("data") or {}
+    message_id = None
+    if isinstance(data, dict) and data.get("message_id") is not None:
+        message_id = str(data["message_id"])
+    return True, message_id
 
 
 def build_segments(parts: list[str], group: bool, reply_id: str | None, user_id) -> list[list[dict]]:
@@ -863,10 +1140,20 @@ def ask_event(event_text: str, context: str) -> str:
 def handle_notice(event: dict) -> dict:
     """撤回 / 入群 / 退群这类群事件，偶尔让她自然接一句。"""
     group_id = str(event.get("group_id", ""))
-    if group_id not in group_whitelist():
-        return {"ok": False, "reason": "群不在白名单"}
     notice_type = event.get("notice_type")
-    if notice_type not in ("group_recall", "group_member_join", "group_member_leave"):
+    join_types = ("group_increase", "group_member_increase", "group_member_join")
+
+    # 自己被拉进新群：先把能拿到的历史补上，新群也要先看一会儿再说话
+    if notice_type in join_types and str(event.get("user_id")) == cfg("QQ_BOT_QQ") and cfg("QQ_BOT_QQ"):
+        threading.Thread(target=backfill_group, args=(group_id,), daemon=True).start()
+        log_line(f"[进群] {group_id} | 自己被拉进群，开始补历史")
+        return {"ok": True, "reason": "自己进群，开始补历史", "group_id": group_id}
+
+    if not group_allowed(group_id):
+        return {"ok": False, "reason": "群不在白名单"}
+    if notice_type not in (
+        "group_recall", *join_types, "group_decrease", "group_member_decrease", "group_member_leave",
+    ):
         return {"ok": False, "reason": "无关通知"}
     user_id = event.get("user_id") or event.get("operator_id")
     if str(user_id) == cfg("QQ_BOT_QQ"):
@@ -883,7 +1170,11 @@ def handle_notice(event: dict) -> dict:
     texts = {
         "group_recall": f"{who}撤回了一条消息",
         "group_member_join": f"{who}进了群",
+        "group_increase": f"{who}进了群",
+        "group_member_increase": f"{who}进了群",
         "group_member_leave": f"{who}退了群",
+        "group_decrease": f"{who}退了群",
+        "group_member_decrease": f"{who}退了群",
     }
     event_text = texts[notice_type]
     reply = ask_event(event_text, build_group_context(group_id))
@@ -969,6 +1260,24 @@ def handle_group_command(group_id: str, user_id, text: str) -> dict | None:
             current.append({"text": fact, "ts": time.time(), "weight": 1.5})
         save_json(PROFILE_FILE, data)
         reply = f"记住了：{nickname} —— {fact}"
+    elif text.startswith(("/回填", "/补历史")):
+        result = backfill_group(group_id, force=True)
+        if result.get("ok"):
+            reply = (
+                f"翻了 {result.get('fetched', 0)} 条，进了 {result.get('added', 0)} 条上下文。"
+                f"这个群叫「{result.get('name') or '不知道'}」。"
+            )
+        else:
+            reply = f"没补成：{result.get('reason')}"
+    elif text.startswith(("/群资料", "/群信息")):
+        entry = refresh_group_intro(group_id)
+        reply = (
+            f"群名「{entry.get('name') or '未知'}」，{entry.get('count') or '?'} 人"
+        )
+        if entry.get("owner"):
+            reply += f"，群主 {entry['owner']}"
+        if entry.get("notice"):
+            reply += f"。公告：{entry['notice'][:60]}"
     else:
         return None
     send_group_parts(group_id, [reply])
@@ -1018,9 +1327,14 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         )
     # 不回复也记下来，观察循环要靠这些上下文判断气氛
     if group and group_id and str(event.get("user_id")) != cfg("QQ_BOT_QQ"):
-        record_group_message(group_id, display_name(event), text)
+        record_group_message(
+            group_id, display_name(event), text, msg_id=str(event.get("message_id") or "")
+        )
         update_profile(group_id, user_id, speaker, text, time.time())
         maybe_remember_group(group_id)
+        # 第一次见到这个群（比如刚被拉进来）：后台补历史 + 读群资料
+        if group_id not in _backfilled and group_allowed(group_id):
+            threading.Thread(target=backfill_group, args=(group_id,), daemon=True).start()
 
     reply_to_bot = is_reply_to_bot(reply_id)
     engage, reason = should_engage(event, text, at_self, reply_to_bot)
@@ -1064,6 +1378,10 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
                 "（请回答上面那句还没被回应的话，不要只评价这句短消息。）"
             )
     profile_context = build_profile_context(group_id) if group else ""
+    if group:
+        intro = intro_context(group_id)
+        if intro:
+            profile_context = (intro + "\n" + profile_context).strip()
     slang = slang_context(group_id) if group else ""
     if slang:
         profile_context = (profile_context + "\n" + slang).strip()
@@ -1136,10 +1454,12 @@ def evaluate_group(
     synthetic_now: float | None = None,
 ) -> dict:
     """看最近群聊，决定要不要自己接一句。force 用于模拟器跳过冷却。"""
-    if not group_id or group_id not in group_whitelist():
+    if not group_id or not group_allowed(group_id):
         return {"ok": False, "spoke": False, "reason": "群不在白名单"}
     if not force and not observe_enabled():
         return {"ok": False, "spoke": False, "reason": "观察未开启"}
+    if not force and time.time() < float(_group_warmup.get(group_id, 0.0)):
+        return {"ok": False, "spoke": False, "reason": "刚进群，先潜水"}
 
     with _observe_lock:
         now = float(synthetic_now or time.time())
@@ -1170,7 +1490,8 @@ def evaluate_group(
         mark_consumed(group_id)
 
     decision = ask_observe(
-        [{"speaker": item.get("speaker", ""), "text": item.get("text", "")} for item in window]
+        [{"speaker": item.get("speaker", ""), "text": item.get("text", "")} for item in window],
+        intro=intro_context(group_id),
     )
     activation = int(decision.get("activation", 0) or 0)
     reason = str(decision.get("reason") or "")
@@ -1213,7 +1534,7 @@ def evaluate_group(
 def observe_loop() -> None:
     while True:
         time.sleep(3)
-        for group_id in sorted(group_whitelist()):
+        for group_id in sorted(known_groups()):
             try:
                 evaluate_group(group_id)
             except Exception as exc:  # noqa: BLE001
@@ -1265,7 +1586,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "core": core_url(),
                     "onebot": onebot_api() or "dry-run",
-                    "groups": sorted(group_whitelist()),
+                    "groups": sorted(known_groups()),
                     "private": sorted(private_whitelist()),
                     "interject": interject_probability(),
                     "cooldown": cooldown_seconds(),
@@ -1276,8 +1597,13 @@ class Handler(BaseHTTPRequestHandler):
                     "observe_min_messages": observe_min_messages(),
                     "observe_daily_calls": observe_daily_calls(),
                     "context_probe": context_probe_enabled(),
-                    "talk_value": {gid: get_talk_value(gid) for gid in sorted(group_whitelist())},
-                    "threshold": {gid: dynamic_threshold(gid) for gid in sorted(group_whitelist())},
+                    "backfill": {
+                        "count": backfill_count(),
+                        "buffer_max": buffer_max(),
+                        "warmup": int(group_warmup()),
+                    },
+                    "talk_value": {gid: get_talk_value(gid) for gid in sorted(known_groups())},
+                    "threshold": {gid: dynamic_threshold(gid) for gid in sorted(known_groups())},
                     "admin": sorted(admin_qq()),
                     "dry": is_dry(),
                 }
@@ -1300,8 +1626,11 @@ class Handler(BaseHTTPRequestHandler):
                                 if k.startswith(f"group_{gid}:")
                             ]),
                             "persona": bool(group_persona(gid)),
+                            "intro": bool(intro_context(gid)),
+                            "backfilled_at": int(_backfilled.get(gid, 0)),
+                            "warmup_left": max(0, int(_group_warmup.get(gid, 0) - time.time())),
                         }
-                        for gid in sorted(group_whitelist())
+                        for gid in sorted(known_groups())
                     }
                 }
             )
@@ -1420,6 +1749,12 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     port = int(cfg("QQ_BRIDGE_PORT", "8767"))
     host = bridge_host()
+    stored = load_json(BACKFILL_FILE, {}) or {}
+    for gid, ts in stored.items():
+        try:
+            _backfilled[str(gid)] = float(ts)
+        except (TypeError, ValueError):
+            continue
     print(f"QQ 桥已启动：http://{host}:{port}", flush=True)
     print(f"核心：{core_url()}", flush=True)
     print(f"OneBot：{onebot_api() or '未配置（干跑模式，只打印不发送）'}", flush=True)
@@ -1428,6 +1763,11 @@ def main() -> None:
     print(
         f"群聊观察：{'开' if observe_enabled() else '关'} | "
         f"阈值 {observe_threshold()}/10 | 发言后冷却 {int(observe_cooldown())} 秒",
+        flush=True,
+    )
+    print(
+        f"历史回填：最多 {backfill_count()} 条 | 缓冲 {buffer_max()} 条 | "
+        f"新群潜水 {int(group_warmup())} 秒",
         flush=True,
     )
     if observe_enabled():

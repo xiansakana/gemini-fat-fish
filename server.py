@@ -549,10 +549,11 @@ def parse_json_object(text: str) -> dict:
     return value
 
 
-def observe_group(messages: list[dict], probe: str = "") -> tuple[dict, dict]:
+def observe_group(messages: list[dict], probe: str = "", intro: str = "") -> tuple[dict, dict]:
     """看一段群聊，判断 Gemini 娘该不该自然接一句。
 
     probe 是刚收到的最新消息：额外判断它是不是在跟她说话（即使没 @）。
+    intro 是这个群的资料（群名、公告、成员），只作背景。
     只调 lite 模型，不写记忆、不进会话历史、不触发进化。
     """
     empty_usage = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -583,11 +584,15 @@ def observe_group(messages: list[dict], probe: str = "") -> tuple[dict, dict]:
     period, clock = time_context()
     if probe_text:
         lines.append(f"【最新消息，要重点判断】{probe_text}")
+    intro_text = str(intro or "").strip()[:800]
+    intro_block = f"群的基本情况（只是背景）：\n{intro_text}\n\n" if intro_text else ""
     system_text = (
         "你在判断一个 QQ 群里的人现在该不该自然接一句话。"
         "你扮演的是 Gemini 娘：四角星猫耳少女，说话短、懒散、带点吐槽，"
         "像真人群友一样潜水，只在话题真的适合时才开口。\n\n"
-        f"现在是{clock}。群聊记录（从旧到新）：\n" + "\n".join(lines) + "\n\n"
+        f"现在是{clock}。"
+        + intro_block
+        + "群聊记录（从旧到新）：\n" + "\n".join(lines) + "\n\n"
         "先判断 addressed：最新那条消息虽然没 @ 她、没叫名字、也没点回复，"
         "但结合上文是不是明显在跟她说话？比如她刚说完一句，紧接着有人追问「所以呢」「你在哪」；"
         "或者群里就她和对方在对话。是的话 addressed=true，并且直接给她该说的回复。"
@@ -1201,7 +1206,8 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(item, dict)
             ]
             probe = str(body.get("probe") or "").strip()[:300]
-            result, usage = observe_group(messages, probe)
+            intro = str(body.get("intro") or "").strip()[:800]
+            result, usage = observe_group(messages, probe, intro)
             self._json({**result, "usage": usage})
             return
         if path == "/api/profile":
