@@ -19,7 +19,7 @@
 - 进化默认自动生效（每 3 轮一次），不需要你逐条批准；想回到确认制，把 `.env` 里 `EVOLVE_MODE` 改成 `confirm`。
 - 每隔 `PROACTIVE_MINUTES`（默认 45）没聊天，她会自己发一句短消息过来，页面每 15 秒轮询一次；上一条没被回就不再连发，凌晨也不打扰。
 - 她有工具：`list_files` / `read_file` / `write_file` / `run_command` / `browse`，通过 Gemini function calling 自动调用，页面上会显示她用了什么工具。
-- 可选接入 QQ 群 / 私聊：通过 OneBot v11 桥接，每个群独立记忆、唤醒词、冷却和每日预算，群聊默认禁用本机工具。
+- 可选接入 QQ 群 / 私聊：通过 OneBot v11 桥接，每个群独立记忆、唤醒词、冷却和每日预算，群聊默认禁用本机工具；没被叫时她会先观察群聊再决定要不要自然接一句。
 
 ## 运行
 
@@ -89,7 +89,8 @@ Gemini 娘能自己列文件、读写文件、敲终端命令、打开网页查�
 QQ ←→ NapCat / LLOneBot（OneBot v11）
           │ HTTP 上报
     onebot_bridge.py :8767
-          │ POST /api/chat（session=group_xxx）
+          ├─ POST /api/chat    （被叫时，session=group_xxx）
+          └─ POST /api/observe （潜水时，只评估不写记忆）
     server.py :8766
 ```
 
@@ -103,15 +104,16 @@ QQ ←→ NapCat / LLOneBot（OneBot v11）
 
 | 规则 | 默认行为 |
 | --- | --- |
-| 什么时候回 | 被 @、被回复、文本里有 `小双/Gemini娘/双子`；否则按 5% 概率插话 |
-| 冷却 | 同一个群 25 秒内只回一次 |
+| 什么时候回 | 被 @、被回复、文本里有 `小双/Gemini娘/双子` 必回；没被叫时走“观察后发言” |
+| 观察后发言 | 每条群消息都进缓冲区；攒够 3 条且距上次评估 45 秒，才调一次 lite 模型打激活度，达到 6/10 才开口 |
+| 潜水规则 | 冷场、刷屏、吵架、她不熟的私事会打低分；只有一个人说话不评估；开口后 4 分钟内不再主动说 |
+| 冷却 | 同一个群 25 秒内只回一次（被叫）；主动发言另算 4 分钟长冷却 |
 | 白名单 | 留空 = 不响应任何群 / 私聊，必须先填群号 |
-| 拆条 | 最多 2 条；第一条引用原消息并 @ 对方 |
-| 记忆 | 每群 `sessions/group_<群号>.json`，每个私聊 `sessions/private_<QQ号>.json`；网页端仍是 `memory.json` |
+| 拆条 | 最多 2 条；被叫时第一条引用原消息并 @ 对方，主动发言不 @ 不引用 |
+| 记忆 | 每群 `sessions/group_<群号>.json`，每个私聊 `sessions/private_<QQ号>.json`；网页端仍是 `memory.json`。观察评估不写记忆 |
 | 权限 | 群聊**没有**文件 / 终端工具，也不注入主人的长期记忆 |
-| 模型 | 群聊固定 `QQ_GROUP_MODEL`（默认 lite），输出上限 260 token，不进化 |
-| 预算 | 每天最多 `QQ_DAILY_CALLS` 次模型调用，超了直接不回 |
-| 主动消息 | 只在网页端，群里不会主动冒泡 |
+| 模型 | 群聊回复用 `QQ_GROUP_MODEL`（默认 lite，260 token）；观察评估用 `QQ_OBSERVE_MODEL`（240 token），都不进化 |
+| 预算 | 对话和观察分开记账：每天最多 `QQ_DAILY_CALLS` + `QQ_OBSERVE_DAILY_CALLS` 次 |
 
 ### 干跑与自测
 
@@ -121,7 +123,23 @@ curl -X POST http://127.0.0.1:8767/simulate -H "Content-Type: application/json" 
   -d '{"message_type":"group","group_id":10000,"user_id":20000,"nickname":"小明","text":"小双在吗"}'
 ```
 
-返回里 `dry_run: true` 表示只打印不发送。运行日志在 `logs/qq-YYYY-MM-DD.log`，调用计数在 `data/qq_budget.json`。
+想看她会不会自己融入群聊，灌一段多人对话：
+
+```bash
+curl -X POST http://127.0.0.1:8767/simulate/chat -H "Content-Type: application/json" -d '{
+  "group_id": 10000,
+  "gap_seconds": 12,
+  "evaluate_every": 4,
+  "messages": [
+    {"nickname": "小林", "text": "刚才刷到个视频，猫摔下来还能稳稳落地"},
+    {"nickname": "阿花", "text": "猫真的有九条命"},
+    {"nickname": "小林", "text": "你说猫是不是知道自己很可爱"},
+    {"nickname": "阿花", "text": "肯定啊，每次闯祸都装无辜"}
+  ]
+}'
+```
+
+返回里每条消息的 `direct` 是“被叫必回”的判定，`observe` 是观察评估的激活度、是否发言和理由。`/simulate` 和 `/simulate/chat` 默认 `dry_run: true`，不会真发到群。运行日志在 `logs/qq-YYYY-MM-DD.log`，调用计数在 `data/qq_budget.json`（对话）和 `data/qq_observe_budget.json`（观察）。
 
 > 非官方 QQ 协议有封号风险，**务必用小号**。群聊是陌生人输入，提示词注入风险比私聊高，默认禁工具、禁私密记忆就是为这个。
 
@@ -147,11 +165,20 @@ curl -X POST http://127.0.0.1:8767/simulate -H "Content-Type: application/json" 
 | `QQ_GROUP_WHITELIST` | 空 | 允许的群号，逗号分隔；空 = 不响应任何群 |
 | `QQ_PRIVATE_WHITELIST` | 空 | 允许的私聊 QQ，逗号分隔；空 = 不响应任何私聊 |
 | `QQ_WAKE_WORDS` | 小双,Gemini娘,双子 | 被叫到这些词就必回 |
-| `QQ_INTERJECT` | 0.05 | 没被叫时的随机插话概率 |
-| `QQ_COOLDOWN` | 25 | 同一个群的回复冷却（秒） |
-| `QQ_GROUP_MODEL` | gemini-3.5-flash-lite | 群聊专用模型 |
+| `QQ_INTERJECT` | 0.02 | 观察机制关掉时的兜底随机插话概率 |
+| `QQ_COOLDOWN` | 25 | 同一个群被叫后的回复冷却（秒） |
+| `QQ_GROUP_MODEL` | gemini-3.5-flash-lite | 群聊回复专用模型 |
 | `QQ_GROUP_MAX_TOKENS` | 260 | 群聊单次输出上限 |
-| `QQ_DAILY_CALLS` | 300 | 每天最多调用多少次模型 |
+| `QQ_DAILY_CALLS` | 300 | 对话每天最多调用多少次模型 |
+| `QQ_OBSERVE_ENABLED` | 1 | 是否开启“观察群聊后自己发言” |
+| `QQ_OBSERVE_MODEL` | gemini-3.5-flash-lite | 观察评估专用模型 |
+| `QQ_OBSERVE_MAX_TOKENS` | 240 | 观察评估输出上限 |
+| `QQ_OBSERVE_WINDOW` | 15 | 评估时带多少条上下文 |
+| `QQ_OBSERVE_MIN_MESSAGES` | 3 | 至少攒几条新消息才评估 |
+| `QQ_OBSERVE_INTERVAL` | 45 | 两次评估最短间隔（秒） |
+| `QQ_OBSERVE_THRESHOLD` | 6 | 激活度达到几分才开口（0–10） |
+| `QQ_OBSERVE_COOLDOWN` | 240 | 她开口后多久不再主动说话（秒） |
+| `QQ_OBSERVE_DAILY_CALLS` | 200 | 观察评估每天最多调用几次 |
 
 ## 边界
 

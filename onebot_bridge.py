@@ -37,8 +37,15 @@ BOT_MESSAGES_FILE = DATA_DIR / "qq_bot_messages.json"
 
 CORE_TIMEOUT = 90
 _reply_lock = threading.Lock()
+_observe_lock = threading.Lock()
+_force_dry = threading.local()
 _group_last_reply: dict[str, float] = {}
+_group_last_observe: dict[str, float] = {}
+_group_buffer: dict[str, list[dict]] = {}
+_group_cursor: dict[str, int] = {}
+_group_seq: dict[str, int] = {}
 _bot_message_ids: list[str] = []
+OBSERVE_BUDGET_FILE = DATA_DIR / "qq_observe_budget.json"
 
 
 def cfg(key: str, default: str = "") -> str:
@@ -81,6 +88,52 @@ def daily_calls() -> int:
         return max(0, int(cfg("QQ_DAILY_CALLS", "300")))
     except ValueError:
         return 300
+
+
+def _int_cfg(key: str, default: int, low: int = 0, high: int = 100000) -> int:
+    try:
+        return max(low, min(high, int(cfg(key, str(default)))))
+    except ValueError:
+        return default
+
+
+def _float_cfg(key: str, default: float, low: float = 0.0, high: float = 86400.0) -> float:
+    try:
+        return max(low, min(high, float(cfg(key, str(default)))))
+    except ValueError:
+        return default
+
+
+def observe_enabled() -> bool:
+    return cfg("QQ_OBSERVE_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+
+
+def observe_window() -> int:
+    return _int_cfg("QQ_OBSERVE_WINDOW", 15, 2, 30)
+
+
+def observe_min_messages() -> int:
+    return _int_cfg("QQ_OBSERVE_MIN_MESSAGES", 3, 1, 30)
+
+
+def observe_interval() -> float:
+    return _float_cfg("QQ_OBSERVE_INTERVAL", 45, 5, 3600)
+
+
+def observe_threshold() -> int:
+    return _int_cfg("QQ_OBSERVE_THRESHOLD", 6, 1, 10)
+
+
+def observe_cooldown() -> float:
+    return _float_cfg("QQ_OBSERVE_COOLDOWN", 240, 30, 86400)
+
+
+def observe_daily_calls() -> int:
+    return _int_cfg("QQ_OBSERVE_DAILY_CALLS", 200, 0, 10000)
+
+
+def is_dry() -> bool:
+    return bool(getattr(_force_dry, "value", False)) or not bool(onebot_api())
 
 
 def core_url() -> str:
@@ -128,6 +181,71 @@ def budget_ok() -> bool:
     data["count"] = int(data.get("count", 0)) + 1
     save_json(BUDGET_FILE, data)
     return True
+
+
+def observe_budget_ok(consume: bool = True) -> bool:
+    """观察评估单独记账，别把主动发言的额度算进日常对话。"""
+    if not consume:
+        return True
+    today = time.strftime("%Y-%m-%d")
+    data = load_json(OBSERVE_BUDGET_FILE, {})
+    if data.get("date") != today:
+        data = {"date": today, "count": 0}
+    if int(data.get("count", 0)) >= observe_daily_calls():
+        return False
+    data["count"] = int(data.get("count", 0)) + 1
+    save_json(OBSERVE_BUDGET_FILE, data)
+    return True
+
+
+def record_group_message(group_id: str, speaker: str, text: str, ts: float | None = None) -> None:
+    """每条群消息都进缓冲区，不回复也记，供之后判断上下文。"""
+    if not text.strip() or not group_id:
+        return
+    with _observe_lock:
+        seq = int(_group_seq.get(group_id, 0)) + 1
+        _group_seq[group_id] = seq
+        buffer = _group_buffer.setdefault(group_id, [])
+        buffer.append(
+            {
+                "seq": seq,
+                "ts": float(ts or time.time()),
+                "speaker": str(speaker)[:20],
+                "text": str(text)[:300],
+            }
+        )
+        del buffer[: -max(observe_window() * 3, 60)]
+
+
+def pending_messages(group_id: str) -> list[dict]:
+    cursor = int(_group_cursor.get(group_id, 0))
+    return [item for item in _group_buffer.get(group_id, []) if item["seq"] > cursor]
+
+
+def mark_consumed(group_id: str) -> None:
+    buffer = _group_buffer.get(group_id) or []
+    if buffer:
+        _group_cursor[group_id] = int(buffer[-1]["seq"])
+
+
+def ask_observe(messages: list[dict]) -> dict:
+    payload = json.dumps({"messages": messages}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        core_url() + "/api/observe",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            return json.load(response)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "activation": 0,
+            "speak": False,
+            "reply": "",
+            "reason": f"评估接口异常：{type(exc).__name__} {exc}",
+        }
 
 
 def remember_bot_message(message_id) -> None:
@@ -267,7 +385,7 @@ def ask_core(text: str, session: str, channel: str, speaker: str) -> tuple[str, 
 
 def call_onebot(action: str, payload: dict) -> bool:
     api = onebot_api()
-    if not api:
+    if is_dry():
         print(f"[干跑] {action} {json.dumps(payload, ensure_ascii=False)[:300]}", flush=True)
         return True
     request = urllib.request.Request(
@@ -301,6 +419,28 @@ def build_segments(parts: list[str], group: bool, reply_id: str | None, user_id)
     return messages
 
 
+def send_group_parts(group_id: str, parts: list[str], reply_id: str | None = None, user_id=None) -> bool:
+    """发送一组消息段；@ 失败时去掉 @ 重发。"""
+    if not parts:
+        return False
+    messages = build_segments(parts, True, reply_id, user_id)
+    with _reply_lock:
+        for index, segments in enumerate(messages):
+            if index:
+                time.sleep(0.8)
+            ok = call_onebot(
+                "send_group_msg", {"group_id": int(group_id), "message": segments}
+            )
+            if not ok and any(seg.get("type") == "at" for seg in segments):
+                fallback = [seg for seg in segments if seg.get("type") != "at"]
+                ok = call_onebot(
+                    "send_group_msg", {"group_id": int(group_id), "message": fallback}
+                )
+            if not ok:
+                return False
+    return True
+
+
 def handle_event(event: dict, simulated: bool = False) -> dict:
     """返回处理结果，便于模拟器直接看到判定过程。"""
     if event.get("post_type") not in (None, "message"):
@@ -316,13 +456,17 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     if not text:
         return {"ok": False, "reason": "空消息"}
 
+    group = message_type == "group"
+    group_id = str(event.get("group_id", ""))
+    # 不回复也记下来，观察循环要靠这些上下文判断气氛
+    if group and group_id and str(event.get("user_id")) != cfg("QQ_BOT_QQ"):
+        record_group_message(group_id, display_name(event), text)
+
     reply_to_bot = is_reply_to_bot(reply_id)
     engage, reason = should_engage(event, text, at_self, reply_to_bot)
     if not engage:
         return {"ok": False, "reason": reason}
 
-    group = message_type == "group"
-    group_id = str(event.get("group_id", ""))
     user_id = event.get("user_id")
     session = f"group_{group_id}" if group else f"private_{user_id}"
     channel = "group" if group else "private"
@@ -334,7 +478,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     if group and event.get("message_id") is not None:
         reply_id = str(event.get("message_id"))
 
-    if not budget_ok():
+    if not simulated and not is_dry() and not budget_ok():
         log_line(f"预算用完，跳过 {session}")
         return {"ok": False, "reason": "今日预算用完"}
 
@@ -347,28 +491,28 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         return {"ok": False, "reason": f"核心调用失败: {error}"}
 
     parts = split_reply(clean_for_group(reply) if group else reply)
-    messages = build_segments(parts, group, reply_id, user_id)
-
-    for index, segments in enumerate(messages):
-        if index:
-            time.sleep(0.8)
-        if group:
-            payload = {"group_id": int(group_id), "message": segments}
-            ok = call_onebot("send_group_msg", payload)
-            if not ok and any(seg.get("type") == "at" for seg in segments):
-                # @ 的号可能不是群成员，NapCat 拿不到 Uid，去掉 @ 重发
-                fallback = [seg for seg in segments if seg.get("type") != "at"]
-                ok = call_onebot("send_group_msg", {"group_id": int(group_id), "message": fallback})
-        else:
-            ok = call_onebot(
-                "send_private_msg",
-                {"user_id": int(user_id), "message": segments},
-            )
-        if not ok:
-            break
+    if group:
+        ok = send_group_parts(group_id, parts, reply_id, user_id)
+    else:
+        ok = True
+        with _reply_lock:
+            for index, part in enumerate(parts):
+                if index:
+                    time.sleep(0.8)
+                if not call_onebot(
+                    "send_private_msg",
+                    {
+                        "user_id": int(user_id),
+                        "message": [{"type": "text", "data": {"text": part}}],
+                    },
+                ):
+                    ok = False
+                    break
 
     if group:
         _group_last_reply[group_id] = time.time()
+        # 她刚开口，之前攒的上下文别再拿来触发一次主动发言
+        mark_consumed(group_id)
     log_line(f"{session} | {speaker} | {text} | {reply[:200]}")
     return {
         "ok": True,
@@ -376,9 +520,92 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         "session": session,
         "reply": reply,
         "parts": parts,
-        "dry_run": not bool(onebot_api()),
+        "sent": ok,
+        "dry_run": is_dry(),
         "simulated": simulated,
     }
+
+
+def evaluate_group(
+    group_id: str,
+    force: bool = False,
+    synthetic_now: float | None = None,
+) -> dict:
+    """看最近群聊，决定要不要自己接一句。force 用于模拟器跳过冷却。"""
+    if not group_id or group_id not in group_whitelist():
+        return {"ok": False, "spoke": False, "reason": "群不在白名单"}
+    if not force and not observe_enabled():
+        return {"ok": False, "spoke": False, "reason": "观察未开启"}
+
+    with _observe_lock:
+        now = float(synthetic_now or time.time())
+        pending = pending_messages(group_id)
+        last_speak = max(
+            _group_last_reply.get(group_id, 0.0),
+            _group_last_observe.get(group_id, 0.0),
+        )
+        if not force:
+            if now - last_speak < observe_cooldown():
+                return {"ok": False, "spoke": False, "reason": "发言冷却中"}
+            if len(pending) < observe_min_messages():
+                return {"ok": False, "spoke": False, "reason": "新消息不够"}
+            if now - float(_group_last_observe.get(group_id + ":eval", 0.0)) < observe_interval():
+                return {"ok": False, "spoke": False, "reason": "评估间隔未到"}
+            speakers = {item.get("speaker") for item in pending}
+            if len(speakers) < 2:
+                return {"ok": False, "spoke": False, "reason": "只有一个人说话"}
+            if not observe_budget_ok():
+                return {"ok": False, "spoke": False, "reason": "观察预算用完"}
+        else:
+            observe_budget_ok(consume=False)
+
+        window = pending[-observe_window():]
+        if not window:
+            return {"ok": False, "spoke": False, "reason": "没有上下文"}
+        _group_last_observe[group_id + ":eval"] = now
+        mark_consumed(group_id)
+
+    decision = ask_observe(
+        [{"speaker": item.get("speaker", ""), "text": item.get("text", "")} for item in window]
+    )
+    activation = int(decision.get("activation", 0) or 0)
+    reason = str(decision.get("reason") or "")
+    result = {
+        "ok": True,
+        "spoke": False,
+        "activation": activation,
+        "reason": reason,
+        "messages": len(window),
+    }
+    threshold = observe_threshold()
+    if decision.get("speak") and activation >= threshold and decision.get("reply"):
+        parts = split_reply(clean_for_group(str(decision["reply"])))
+        if parts:
+            ok = send_group_parts(group_id, parts)
+            result["spoke"] = True
+            result["reply"] = str(decision["reply"])
+            result["parts"] = parts
+            result["sent"] = ok
+            with _observe_lock:
+                _group_last_observe[group_id] = now
+                _group_last_reply[group_id] = now
+            log_line(
+                f"group_{group_id} | 主动发言 | 激活度 {activation}/10 | "
+                f"{reason} | {str(decision['reply'])[:120]}"
+            )
+            return result
+    log_line(f"group_{group_id} | 观察后沉默 | 激活度 {activation}/10 | {reason}")
+    return result
+
+
+def observe_loop() -> None:
+    while True:
+        time.sleep(3)
+        for group_id in sorted(group_whitelist()):
+            try:
+                evaluate_group(group_id)
+            except Exception as exc:  # noqa: BLE001
+                log_line(f"观察循环异常 {group_id}: {type(exc).__name__} {exc}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -413,6 +640,28 @@ class Handler(BaseHTTPRequestHandler):
                     "private": sorted(private_whitelist()),
                     "interject": interject_probability(),
                     "cooldown": cooldown_seconds(),
+                    "observe": observe_enabled(),
+                    "observe_threshold": observe_threshold(),
+                    "observe_cooldown": int(observe_cooldown()),
+                    "observe_interval": int(observe_interval()),
+                    "observe_min_messages": observe_min_messages(),
+                    "observe_daily_calls": observe_daily_calls(),
+                    "dry": is_dry(),
+                }
+            )
+            return
+        if self.path.startswith("/debug"):
+            self._json(
+                {
+                    "groups": {
+                        gid: {
+                            "buffered": len(_group_buffer.get(gid, [])),
+                            "unseen": len(pending_messages(gid)),
+                            "last_reply": int(_group_last_reply.get(gid, 0)),
+                            "last_speak": int(_group_last_observe.get(gid, 0)),
+                        }
+                        for gid in sorted(group_whitelist())
+                    }
                 }
             )
             return
@@ -428,6 +677,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/simulate":
             body = self._body()
+            _force_dry.value = bool(body.get("dry", True))
             event = {
                 "post_type": "message",
                 "message_type": body.get("message_type", "group"),
@@ -439,6 +689,69 @@ class Handler(BaseHTTPRequestHandler):
             }
             self._json(handle_event(event, simulated=True))
             return
+        if self.path == "/simulate/chat":
+            body = self._body()
+            _force_dry.value = bool(body.get("dry", True))
+            group_id = str(body.get("group_id", "10000"))
+            gap = max(1.0, float(body.get("gap_seconds", 12)))
+            evaluate_every = max(0, int(body.get("evaluate_every", 3)))
+            incoming = body.get("messages") or []
+            if not isinstance(incoming, list) or not incoming:
+                self._json({"ok": False, "reason": "messages 不能为空"}, 400)
+                return
+            base_ts = time.time() - gap * len(incoming)
+            trace: list[dict] = []
+            for index, item in enumerate(incoming):
+                if not isinstance(item, dict):
+                    continue
+                ts = base_ts + index * gap
+                msg_id = f"sim-{int(ts)}-{index}"
+                event = {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "group_id": group_id,
+                    "user_id": item.get("user_id", 20000 + index),
+                    "message_id": msg_id,
+                    "sender": {"nickname": str(item.get("nickname") or f"群友{index + 1}")[:20]},
+                    "message": [{"type": "text", "data": {"text": str(item.get("text") or "")}}],
+                }
+                direct = handle_event(event, simulated=True)
+                if direct.get("ok"):
+                    # 模拟器里把直接回复的时间也对齐到虚拟时钟
+                    _group_last_reply[group_id] = ts
+                trace.append(
+                    {
+                        "at": index + 1,
+                        "who": str(item.get("nickname") or f"群友{index + 1}"),
+                        "text": str(item.get("text") or ""),
+                        "direct": {
+                            "ok": direct.get("ok"),
+                            "reason": direct.get("reason"),
+                            "reply": direct.get("reply"),
+                        },
+                    }
+                )
+                if evaluate_every and (index + 1) % evaluate_every == 0:
+                    trace[-1]["observe"] = evaluate_group(group_id, force=True, synthetic_now=ts)
+                    evaluated_at_end = True
+                else:
+                    evaluated_at_end = False
+            if not evaluated_at_end:
+                trace[-1]["observe"] = evaluate_group(
+                    group_id,
+                    force=True,
+                    synthetic_now=base_ts + len(incoming) * gap,
+                )
+            self._json(
+                {
+                    "ok": True,
+                    "group_id": group_id,
+                    "dry_run": is_dry(),
+                    "threshold": observe_threshold(),
+                    "trace": trace,
+                }
+            )
+            return
         self._json({"error": "not found"}, 404)
 
 
@@ -449,6 +762,13 @@ def main() -> None:
     print(f"OneBot：{onebot_api() or '未配置（干跑模式，只打印不发送）'}", flush=True)
     print(f"群白名单：{sorted(group_whitelist()) or '空（不会回任何群）'}", flush=True)
     print(f"私聊白名单：{sorted(private_whitelist()) or '空（不会回任何私聊）'}", flush=True)
+    print(
+        f"群聊观察：{'开' if observe_enabled() else '关'} | "
+        f"阈值 {observe_threshold()}/10 | 发言后冷却 {int(observe_cooldown())} 秒",
+        flush=True,
+    )
+    if observe_enabled():
+        threading.Thread(target=observe_loop, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 

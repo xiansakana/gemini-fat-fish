@@ -25,7 +25,7 @@ ssh -L 8766:127.0.0.1:8766 gcp
 ├── memory.json       网页端记忆（不进 git）
 ├── sessions/         各群 / 私聊记忆（不进 git）
 ├── logs/             server.log / bridge.log / qq-*.log
-└── data/             qq_budget.json
+└── data/             qq_budget.json / qq_observe_budget.json
 ```
 
 ## 首次安装（已执行）
@@ -76,6 +76,30 @@ tail -f /srv/apps/gemini-fat-fish/logs/server.log
 tail -f /srv/apps/gemini-fat-fish/logs/bridge.log
 curl -s http://127.0.0.1:8766/api/state | head -c 300
 curl -s http://127.0.0.1:8767/health
+```
+
+## 群聊观察配置
+
+桥每 3 秒检查白名单群：攒够 `QQ_OBSERVE_MIN_MESSAGES` 条新消息、距上次评估超过 `QQ_OBSERVE_INTERVAL` 秒、且至少两个人说过话，才调一次 `/api/observe`。激活度达到 `QQ_OBSERVE_THRESHOLD` 才发言，发言后 `QQ_OBSERVE_COOLDOWN` 秒内不再主动开口。评估不写会话记忆。
+
+服务器 `.env` 里相关的正式值：
+
+```
+QQ_INTERJECT=0.02
+QQ_OBSERVE_ENABLED=1
+QQ_OBSERVE_MIN_MESSAGES=3
+QQ_OBSERVE_INTERVAL=45
+QQ_OBSERVE_THRESHOLD=6
+QQ_OBSERVE_COOLDOWN=240
+QQ_OBSERVE_DAILY_CALLS=200
+```
+
+本地灌一段群聊看判定（不会真发到 QQ）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8767/simulate/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id":1129990537,"gap_seconds":12,"evaluate_every":4,"messages":[{"nickname":"小林","text":"刚才刷到个视频，猫摔下来还能稳稳落地"},{"nickname":"阿花","text":"猫真的有九条命"},{"nickname":"小林","text":"你说猫是不是知道自己很可爱"},{"nickname":"阿花","text":"肯定啊，每次闯祸都装无辜"}]}'
 ```
 
 ## NapCat（已部署）
