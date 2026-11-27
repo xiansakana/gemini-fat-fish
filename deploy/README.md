@@ -11,6 +11,12 @@
                                    └─ gemini-fish-update.timer 每 5 分钟拉一次 git
 ```
 
+## 联网工具依赖
+
+`net_tools.py` 用系统自带的 `chromium` 渲染 JS 页面（`--headless --no-sandbox`，每次独立 `--user-data-dir`，4 秒虚拟时间预算）。
+搜索优先走 Bing 的 RSS 接口（无反爬、0.2 秒），DDG lite 作备用；纯 HTTP 抓 Bing 会拿到垃圾结果，别改回去。
+`surf.json` 存她自己刷到的视频，属于运行数据，已在 `.gitignore` 里。
+
 ## 时区
 
 主机时区是 `Asia/Shanghai`（`timedatectl set-timezone Asia/Shanghai`），NapCat 容器也带 `TZ=Asia/Shanghai`。
