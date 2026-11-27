@@ -12,7 +12,9 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
+import urllib.request
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -122,6 +124,354 @@ def status_snapshot() -> dict:
     }
 
 
+
+# ------------------------------ 配置页 ------------------------------
+# 只有列在 CONFIG_FIELDS 里的 key 才会被读到 / 写到；
+# GEMINI_API_KEY、LOGVIEW_TOKEN、QQ_ADMIN_QQ、QQ_BOT_QQ 一律不经过网页。
+ENV_PATH = os.path.join(ROOT, ".env")
+TALK_VALUE_PATH = os.path.join(ROOT, "data", "qq_talk_value.json")
+ENV_BACKUP = os.path.join(ROOT, ".env.bak")
+BOOL_ON = ("1", "true", "yes", "on")
+BOOL_OFF = ("0", "false", "no", "off")
+
+
+def field(key, label, kind, group, default, help="", **kw):
+    item = {"key": key, "label": label, "kind": kind, "group": group,
+            "default": str(default), "help": help}
+    item.update(kw)
+    return item
+
+
+CONFIG_GROUPS = [
+    {"id": "groups", "label": "群与白名单", "open": True,
+     "hint": "拉进新群默认自动放行，不用再手改 .env"},
+    {"id": "chatty", "label": "话痨与开口门槛", "open": True,
+     "hint": "决定她多爱说话、多久评估一次"},
+    {"id": "shape", "label": "回复形态", "open": False,
+     "hint": "短句、拆条、打字节奏、表情概率"},
+    {"id": "budget", "label": "额度与预算", "open": False,
+     "hint": "每日调用上限，防止话痨烧太多额度"},
+    {"id": "model", "label": "模型与思考", "open": False,
+     "hint": "群聊 / 观察用的模型和输出长度"},
+    {"id": "misc", "label": "视觉与上下文", "open": False,
+     "hint": "看图、补历史、记忆缓冲"},
+]
+
+CONFIG_FIELDS = [
+    # 群与白名单
+    field("QQ_GROUP_WHITELIST", "群白名单", "list", "groups", "",
+          "逗号分隔的群号；填 * 表示所有群都生效"),
+    field("QQ_AUTO_WHITELIST", "新群自动放行", "bool", "groups", "1",
+          "被拉进新群时自动把群号写进白名单，省得每次手动配置"),
+    field("QQ_PRIVATE_WHITELIST", "私聊白名单", "list", "groups", "",
+          "允许私聊的 QQ 号，留空表示不限制"),
+    field("QQ_WAKE_WORDS", "唤醒词", "list", "groups", "小双,Gemini娘,双子",
+          "叫这些名字就算点名"),
+    field("QQ_AUTO_ACCEPT_INVITE", "自动同意入群邀请", "bool", "groups", "1", ""),
+    field("QQ_JOIN_GREET", "进群打招呼", "bool", "groups", "1",
+          "刚进群且没人说话时主动冒一句"),
+    # 话痨与开口门槛
+    field("QQ_CHATTY", "话痨模式", "bool", "chatty", "1",
+          "放宽观察评估，激活度过线就接话"),
+    field("QQ_CHATTY_HINT", "话痨风格提示", "textarea", "chatty", "",
+          "追加到她的人设里的说话风格；留空恢复原本的懒散人设", maxlen=500),
+    field("QQ_OBSERVE_ENABLED", "启用群聊观察", "bool", "chatty", "1",
+          "关掉后她只在被点名时才说话"),
+    field("QQ_OBSERVE_THRESHOLD", "基础开口阈值", "int", "chatty", 6,
+          "最终阈值 = 基础阈值 ÷ 该群活跃档位；数值越低越爱说", min=1, max=20),
+    field("QQ_THRESHOLD_MIN", "阈值下限", "int", "chatty", 2,
+          "再怎么调也不会低于这个值", min=1, max=9),
+    field("QQ_THRESHOLD_DYNAMIC", "阈值随群活跃度浮动", "bool", "chatty", "0",
+          "开启后群里太热闹会自动把阈值 +1，太冷清 -1"),
+    field("QQ_OBSERVE_MIN_MESSAGES", "触发评估的最少消息数", "int", "chatty", 2,
+          "攒够几条新消息才评估一次", min=1, max=30),
+    field("QQ_OBSERVE_MIN_SPEAKERS", "触发评估的最少人数", "int", "chatty", 1,
+          "设 1 表示一个人自言自语她也会接", min=1, max=5),
+    field("QQ_OBSERVE_INTERVAL", "评估间隔（秒）", "int", "chatty", 15,
+          "两次评估之间的最短间隔", min=5, max=600),
+    field("QQ_OBSERVE_COOLDOWN", "发言后长冷却（秒）", "int", "chatty", 45,
+          "她主动说完一句后多久不再主动插话", min=5, max=1800),
+    field("QQ_COOLDOWN", "普通插话冷却（秒）", "int", "chatty", 10,
+          "被点名回复后的最短间隔", min=0, max=600),
+    field("QQ_INTERJECT", "随机插话概率", "float", "chatty", 0.02,
+          "0 = 从不随机插话，1 = 每条都插", min=0, max=1),
+    # 回复形态
+    field("QQ_SPLIT_PARTS", "最多拆成几条", "int", "shape", 3,
+          "一条回复最多发几条短消息", min=1, max=5),
+    field("QQ_TYPING_MS", "打字速度（毫秒/字）", "int", "shape", 90,
+          "多条消息之间按字数停顿，越小发得越快", min=20, max=400),
+    field("QQ_TYPING_MAX", "单次停顿上限（秒）", "float", "shape", 6,
+          "一条特别长的话最多停多久", min=0.5, max=30),
+    field("QQ_STICKER_RATE", "发表情概率", "float", "shape", 0.08, "", min=0, max=1),
+    field("QQ_NOTICE_RATE", "接群通知概率", "float", "shape", 0.5, "", min=0, max=1),
+    field("QQ_GROUP_MAX_TOKENS", "群聊单次输出上限", "int", "shape", 260,
+          "调大容易变啰嗦，调小会更短", min=60, max=1024),
+    # 额度
+    field("QQ_DAILY_CALLS", "群聊每日调用上限", "int", "budget", 600, "", min=0, max=10000),
+    field("QQ_OBSERVE_DAILY_CALLS", "观察每日调用上限", "int", "budget", 800,
+          "话痨模式主要消耗这一项", min=0, max=10000),
+    field("SURF_ENABLED", "允许她自己上网", "bool", "budget", "1", ""),
+    field("SURF_DAILY_CALLS", "上网每日次数", "int", "budget", 8, "", min=0, max=200),
+    field("SURF_INTERVAL_MINUTES", "上网间隔（分钟）", "int", "budget", 180,
+          "", min=10, max=1440),
+    # 模型
+    field("QQ_GROUP_MODEL", "群聊模型", "text", "model", "gemini-3.5-flash-lite",
+          "", maxlen=120, pattern=r"[A-Za-z0-9._\-/]+"),
+    field("QQ_OBSERVE_MODEL", "观察评估模型", "text", "model", "gemini-3.5-flash-lite",
+          "", maxlen=120, pattern=r"[A-Za-z0-9._\-/]+"),
+    field("THINKING_LEVEL", "思考强度", "text", "model", "low",
+          "一般填 low / medium / high；留空用模型默认", maxlen=40,
+          pattern=r"[A-Za-z0-9_\-]+"),
+    field("MAX_OUTPUT_TOKENS", "核心最大输出 token", "int", "model", 512,
+          "", min=128, max=4096),
+    # 视觉与上下文
+    field("QQ_VISION", "允许看图 / 视频", "bool", "misc", "1", ""),
+    field("QQ_VISION_MAX_IMAGES", "单次最多看几张图", "int", "misc", 3, "", min=1, max=10),
+    field("QQ_VISION_VIDEO_MB", "视频大小上限（MB）", "int", "misc", 20, "", min=1, max=100),
+    field("QQ_VISION_VIDEO_SECONDS", "视频时长上限（秒）", "int", "misc", 45, "", min=5, max=300),
+    field("QQ_CONTEXT_PROBE", "上下文追问判定", "bool", "misc", "1",
+          "判断一句话是不是在接她刚才的话题"),
+    field("QQ_BACKFILL_COUNT", "进群补历史条数", "int", "misc", 200, "", min=0, max=500),
+    field("QQ_BUFFER_MAX", "群消息缓冲上限", "int", "misc", 240, "", min=20, max=1000),
+    field("QQ_GROUP_WARMUP", "进群预热（秒）", "int", "misc", 300,
+          "刚进群先看一会儿再说话", min=0, max=1800),
+]
+CONFIG_KEYS = {item["key"] for item in CONFIG_FIELDS}
+FIELDS_BY_KEY = {item["key"]: item for item in CONFIG_FIELDS}
+
+
+def normalize_value(spec, value):
+    """把网页提交的值校验并归一化成能安全写进 .env 的单行字符串。"""
+    raw = "" if value is None else str(value).strip()
+    kind = spec["kind"]
+    if not raw:
+        if kind in ("bool",):
+            return "0"
+        if kind in ("int", "float"):
+            return spec["default"]
+        if kind == "select":
+            return spec["default"]
+        return ""
+    if kind == "bool":
+        low = raw.lower()
+        if low in BOOL_ON:
+            return "1"
+        if low in BOOL_OFF:
+            return "0"
+        raise ValueError("只能填 0 或 1")
+    if kind == "int":
+        try:
+            number = int(float(raw))
+        except (TypeError, ValueError):
+            raise ValueError("要填整数")
+        low, high = spec.get("min", 0), spec.get("max", 999999)
+        if not low <= number <= high:
+            raise ValueError(f"范围 {low}~{high}")
+        return str(number)
+    if kind == "float":
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError("要填数字")
+        low, high = spec.get("min", 0), spec.get("max", 999999)
+        if not low <= number <= high:
+            raise ValueError(f"范围 {low}~{high}")
+        return "%g" % number
+    if kind == "list":
+        parts = [part for part in re.split(r"[,，\s]+", raw) if part]
+        for part in parts:
+            if not re.fullmatch(r"[0-9A-Za-z_\-\u4e00-\u9fff.*]+", part):
+                raise ValueError("只能填群号 / 昵称 / 数字，不能含特殊符号")
+        return ",".join(parts)
+    if kind in ("text", "textarea", "select"):
+        clean = re.sub(r"[\r\n\t]+", " ", raw)
+        limit = spec.get("maxlen", 120)
+        if len(clean) > limit:
+            raise ValueError(f"最多 {limit} 个字")
+        pattern = spec.get("pattern")
+        if pattern and clean and not re.fullmatch(pattern, clean):
+            raise ValueError("格式不对，只能填字母数字和 . _ - /")
+        if kind == "select" and clean not in spec.get("options", []):
+            raise ValueError("不在可选值里")
+        return clean
+    raise ValueError("未知字段类型")
+
+
+def _atomic_write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def update_env(updates):
+    """按 key 原地替换 .env 里的行，保留注释、未知项和原有的顺序。"""
+    current = load_env(ENV_PATH)
+    changed = [key for key, value in updates.items() if current.get(key, "") != value]
+    if not changed:
+        return []
+    try:
+        text = open(ENV_PATH, encoding="utf-8").read()
+    except OSError:
+        text = ""
+    lines = text.splitlines()
+    seen = set()
+    out = []
+    for line in lines:
+        matched = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if matched and matched.group(1) in updates:
+            key = matched.group(1)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(f"{key}={updates[key]}")
+        else:
+            out.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out.append(f"{key}={value}")
+    new_text = "\n".join(out).rstrip("\n") + "\n"
+    if os.path.exists(ENV_PATH):
+        shutil.copy2(ENV_PATH, ENV_BACKUP)
+        os.chmod(ENV_BACKUP, 0o600)
+    _atomic_write(ENV_PATH, new_text)
+    return changed
+
+
+def read_talk_values():
+    try:
+        with open(TALK_VALUE_PATH, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return {str(k): float(v) for k, v in data.items()}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def write_talk_values(values):
+    if not isinstance(values, dict):
+        return []
+    data = read_talk_values()
+    changed = []
+    for gid, value in values.items():
+        gid = str(gid)
+        if not re.fullmatch(r"\d{5,12}", gid):
+            continue
+        try:
+            number = max(0.2, min(3.0, float(value)))
+        except (TypeError, ValueError):
+            continue
+        if abs(float(data.get(gid, 1.0)) - number) > 1e-6:
+            data[gid] = number
+            changed.append(gid)
+    if changed:
+        _atomic_write(TALK_VALUE_PATH, json.dumps(data, ensure_ascii=False))
+    return changed
+
+
+def _post_json(url, payload, timeout=6):
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def service_urls():
+    core = ENV.get("PORT", "8766")
+    bridge = ENV.get("QQ_BRIDGE_PORT", "8767")
+    return {
+        "core": f"http://127.0.0.1:{core}/api/reload",
+        "bridge": f"http://127.0.0.1:{bridge}/api/reload",
+    }
+
+
+def reload_services():
+    result = {}
+    for name, url in service_urls().items():
+        try:
+            result[name] = {"ok": True, "detail": _post_json(url, {})}
+        except Exception as exc:  # noqa: BLE001
+            result[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return result
+
+
+def restart_services():
+    try:
+        done = subprocess.run(
+            ["sudo", "-n", "systemctl", "restart", "gemini-fish", "gemini-fish-qq"],
+            capture_output=True, timeout=40, check=False,
+        )
+        output = (done.stdout + done.stderr).decode("utf-8", "replace").strip()
+        return {"ok": done.returncode == 0, "output": output[:400]}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "output": f"{type(exc).__name__}: {exc}"}
+
+
+def bridge_health():
+    port = ENV.get("QQ_BRIDGE_PORT", "8767")
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=4) as response:
+            return json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def config_snapshot():
+    raw = load_env(ENV_PATH)
+    values = {spec["key"]: raw.get(spec["key"], spec["default"]) for spec in CONFIG_FIELDS}
+    health = bridge_health()
+    groups = health.get("groups") or []
+    if not groups:
+        groups = [part for part in re.split(r"[,，\s]+", values["QQ_GROUP_WHITELIST"]) if part and part != "*"]
+    return {
+        "ok": True,
+        "groups": CONFIG_GROUPS,
+        "fields": CONFIG_FIELDS,
+        "values": values,
+        "talk_values": read_talk_values(),
+        "health": {
+            "groups": groups,
+            "threshold": health.get("threshold", {}),
+            "talk_value": health.get("talk_value", {}),
+            "dry": health.get("dry", None),
+        },
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def save_config(body):
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "请求格式不对"}
+    incoming = body.get("values") or {}
+    if not isinstance(incoming, dict):
+        return {"ok": False, "error": "values 格式不对"}
+    updates, errors = {}, []
+    for key, value in incoming.items():
+        spec = FIELDS_BY_KEY.get(key)
+        if not spec:
+            continue  # 未知 key 直接忽略，绝不写进 .env
+        try:
+            updates[key] = normalize_value(spec, value)
+        except ValueError as exc:
+            errors.append(f"{spec['label']}（{key}）：{exc}")
+    if errors:
+        return {"ok": False, "error": "；".join(errors[:6])}
+    changed = update_env(updates)
+    talk_changed = write_talk_values(body.get("talk_values") or {})
+    reloaded = reload_services()
+    return {
+        "ok": True,
+        "changed": changed,
+        "talk_changed": talk_changed,
+        "reloaded": reloaded,
+        "reload_ok": all(item.get("ok") for item in reloaded.values()),
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -176,6 +526,41 @@ pre.nowrap { white-space: pre; word-break: normal; overflow-x: auto; }
 .l-ok { color: var(--ok); }
 .l-accent { color: #9f92ff; }
 .l-dim { color: var(--dim); }
+.cfg { max-width: 1000px; padding: 14px 16px 60px; }
+.cfg-bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.cfg-bar strong { font-size: 15px; }
+.cfg-note { color: var(--dim); font-size: 12px; margin-left: 10px; }
+.cfg-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.cfg-actions input[type=text] { width: 160px; }
+button.primary { background: #2b2550; border-color: var(--accent); color: #fff; }
+button.ghost { color: var(--dim); }
+.cfg-msg { padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; background: var(--panel); border: 1px solid var(--line); font-size: 12.5px; color: var(--dim); }
+.cfg-msg.ok { color: var(--ok); border-color: #2c5540; }
+.cfg-msg.err { color: var(--err); border-color: #5a3030; }
+details.grp { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 10px; padding: 0 14px; }
+details.grp > summary { cursor: pointer; padding: 11px 0; font-weight: 600; font-size: 13.5px; list-style: none; }
+details.grp > summary::-webkit-details-marker { display: none; }
+details.grp > summary::before { content: '\25B8'; color: var(--accent); margin-right: 8px; }
+details.grp[open] > summary::before { content: '\25BE'; }
+.grp-hint { color: var(--dim); font-weight: 400; font-size: 12px; margin-left: 10px; }
+.grp-body { padding: 2px 0 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px 18px; }
+.cfg-row { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.cfg-row label { font-size: 13px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.cfg-row .k { color: var(--dim); font-size: 10.5px; font-family: "SF Mono", Menlo, Consolas, monospace; }
+.cfg-row .help, .talk-row .help { color: var(--dim); font-size: 11.5px; line-height: 1.45; }
+.cfg-row input, .cfg-row select, .cfg-row textarea {
+  width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; font-size: 13px;
+}
+.cfg-row input:focus, .cfg-row select:focus, .cfg-row textarea:focus { outline: none; border-color: var(--accent); }
+.cfg-row textarea { resize: vertical; min-height: 62px; }
+.talk-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px dashed var(--line); flex-wrap: wrap; }
+.talk-row .gid { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; min-width: 118px; }
+.talk-row input { width: 88px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 7px; font-size: 12.5px; }
+.badge { background: #221f3a; color: #b9aeff; border: 1px solid #3a3358; border-radius: 5px; padding: 2px 7px; font-size: 11.5px; white-space: nowrap; }
+.cfg-foot { color: var(--dim); font-size: 12px; margin-top: 16px; line-height: 1.75; }
+.cfg-foot code { color: #b9aeff; }
+pre[hidden], .controls[hidden], .cfg[hidden], .cfg-row[hidden] { display: none !important; }
 .login { max-width: 380px; margin: 18vh auto; padding: 24px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
 .login h2 { margin: 0 0 12px; font-size: 16px; }
 .login p { color: var(--dim); font-size: 12.5px; }
@@ -186,7 +571,7 @@ pre.nowrap { white-space: pre; word-break: normal; overflow-x: auto; }
 <header>
   <h1>Gemini 娘 <span>后台日志</span></h1>
   <div class="tabs" id="tabs"></div>
-  <div class="controls">
+  <div class="controls" id="controls">
     <span class="dot" id="dot"></span>
     <input type="text" id="grep" placeholder="过滤关键词，如 入站 / 回填 / 错误">
     <select id="lines">
@@ -207,6 +592,24 @@ pre.nowrap { white-space: pre; word-break: normal; overflow-x: auto; }
 </header>
 <div class="meta" id="meta">正在加载…</div>
 <pre id="log"></pre>
+<div id="config" class="cfg" hidden>
+  <div class="cfg-bar">
+    <div><strong>运行配置</strong><span class="cfg-note">保存后热重载到核心与桥，立即生效，不清空聊天上下文</span></div>
+    <div class="cfg-actions">
+      <input type="text" id="cfg-search" placeholder="搜索配置项">
+      <button id="cfg-refresh">重新读取</button>
+      <button id="cfg-restart" class="ghost">强制重启</button>
+      <button id="cfg-save" class="primary">保存并生效</button>
+    </div>
+  </div>
+  <div id="cfg-msg" class="cfg-msg">正在读取配置…</div>
+  <div id="cfg-groups"></div>
+  <div class="cfg-foot">
+    改动直接写到服务器 <code>.env</code>（保存前自动备份为 <code>.env.bak</code>），
+    再调用核心与桥的 <code>/api/reload</code> 热重载；API Key、访问令牌、管理员 QQ 不会出现在页面上，也不会被网页改写。<br>
+    「强制重启」只在热重载失败或改了需要重启的参数时使用，会清空她正在观察的群聊上下文。
+  </div>
+</div>
 <script>
 const state = { src: 'bridge', wrap: true, timer: null, stick: true, at: 0, desc: true };
 try {
@@ -247,6 +650,7 @@ function render(lines, desc = state.desc) {
 }
 
 async function load() {
+  if (state.src === 'config') return;
   const n = document.getElementById('lines').value;
   try {
     if (state.src === 'status') {
@@ -288,7 +692,19 @@ function setSource(src, label) {
   state.src = src;
   state.stick = true;
   document.querySelectorAll('.tab').forEach((el) => el.classList.toggle('on', el.dataset.src === src));
-  load();
+  const isConfig = src === 'config';
+  logEl.hidden = isConfig;
+  document.getElementById('config').hidden = !isConfig;
+  document.getElementById('controls').hidden = isConfig;
+  if (isConfig) {
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+    dotEl.classList.remove('live');
+    metaEl.textContent = '运行配置 · 保存后热重载立即生效';
+    loadConfig();
+  } else {
+    restartTimer();
+    load();
+  }
 }
 
 async function initTabs() {
@@ -309,11 +725,18 @@ async function initTabs() {
   statusBtn.textContent = '运行状态';
   statusBtn.onclick = () => setSource('status', '运行状态');
   box.appendChild(statusBtn);
+  const cfgBtn = document.createElement('button');
+  cfgBtn.className = 'tab';
+  cfgBtn.dataset.src = 'config';
+  cfgBtn.textContent = '配置';
+  cfgBtn.onclick = () => setSource('config', '配置');
+  box.appendChild(cfgBtn);
   setSource('bridge');
 }
 
 function restartTimer() {
   if (state.timer) clearInterval(state.timer);
+  if (state.src === 'config') { state.timer = null; return; }
   const ms = Number(document.getElementById('every').value);
   state.timer = ms ? setInterval(load, ms) : null;
 }
@@ -344,6 +767,211 @@ document.getElementById('copy').onclick = async () => {
   await navigator.clipboard.writeText(logEl.innerText);
   metaEl.textContent = '已复制当前视图到剪贴板';
 };
+// ------------------------------ 配置页 ------------------------------
+const cfgMsg = document.getElementById('cfg-msg');
+let cfgDirty = false;
+
+function cfgSay(text, kind) {
+  cfgMsg.className = 'cfg-msg' + (kind ? ' ' + kind : '');
+  cfgMsg.textContent = text;
+}
+
+function esc(text) {
+  const div = document.createElement('div');
+  div.textContent = String(text);
+  return div.innerHTML;
+}
+
+async function loadConfig() {
+  cfgSay('正在读取配置…', '');
+  try {
+    const resp = await fetch('/api/config', { cache: 'no-store' });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || '读取失败');
+    renderConfig(data);
+    cfgDirty = false;
+    cfgSay('已读取 · ' + data.at + ' · 修改后点「保存并生效」', 'ok');
+  } catch (err) {
+    cfgSay('读取失败：' + err.message, 'err');
+  }
+}
+
+function renderConfig(data) {
+  const tv = data.talk_values || {};
+  const th = (data.health && data.health.threshold) || {};
+  const groups = (data.health && data.health.groups) || [];
+  const box = document.getElementById('cfg-groups');
+  box.replaceChildren();
+
+  const talk = document.createElement('details');
+  talk.className = 'grp';
+  talk.open = true;
+  const talkSum = document.createElement('summary');
+  talkSum.textContent = '各群活跃档位';
+  const talkHint = document.createElement('span');
+  talkHint.className = 'grp-hint';
+  talkHint.textContent = '数值越大越话痨，最终阈值 = 基础阈值 ÷ 档位';
+  talkSum.appendChild(talkHint);
+  talk.appendChild(talkSum);
+  const talkBody = document.createElement('div');
+  talkBody.className = 'grp-body';
+  talkBody.id = 'cfg-talk';
+  if (!groups.length) {
+    const empty = document.createElement('div');
+    empty.className = 'help';
+    empty.textContent = '还没有群。把她拉进群后会自动出现，或在「群白名单」里手动填群号。';
+    talkBody.appendChild(empty);
+  }
+  for (const gid of groups) {
+    const row = document.createElement('div');
+    row.className = 'talk-row';
+    const value = tv[gid] !== undefined ? Number(tv[gid]) : 1.0;
+    row.innerHTML = '<span class="gid">' + esc(gid) + '</span>'
+      + '<span class="help">档位</span>'
+      + '<input type="number" min="0.2" max="3" step="0.1" data-gid="' + esc(gid) + '" value="' + value + '" data-init="' + value + '">'
+      + '<span class="badge">当前阈值 ' + (th[gid] !== undefined ? th[gid] : '?') + '</span>'
+      + '<span class="help">3.0 话痨(2) · 2.0 活跃(3) · 1.0 普通(6) · 0.7 安静(9)</span>';
+    talkBody.appendChild(row);
+  }
+  talk.appendChild(talkBody);
+  box.appendChild(talk);
+
+  for (const grp of data.groups) {
+    const details = document.createElement('details');
+    details.className = 'grp';
+    details.open = !!grp.open;
+    const sum = document.createElement('summary');
+    sum.textContent = grp.label;
+    const hint = document.createElement('span');
+    hint.className = 'grp-hint';
+    hint.textContent = grp.hint || '';
+    sum.appendChild(hint);
+    details.appendChild(sum);
+    const body = document.createElement('div');
+    body.className = 'grp-body';
+    for (const spec of data.fields.filter((f) => f.group === grp.id)) {
+      const row = document.createElement('div');
+      row.className = 'cfg-row';
+      row.dataset.key = spec.key;
+      const label = document.createElement('label');
+      label.textContent = spec.label;
+      const code = document.createElement('span');
+      code.className = 'k';
+      code.textContent = spec.key;
+      label.appendChild(code);
+      row.appendChild(label);
+      let input;
+      if (spec.kind === 'bool') {
+        input = document.createElement('select');
+        input.innerHTML = '<option value="1">开启</option><option value="0">关闭</option>';
+        input.value = String(data.values[spec.key]) === '0' ? '0' : '1';
+      } else if (spec.kind === 'textarea') {
+        input = document.createElement('textarea');
+        input.value = data.values[spec.key] || '';
+      } else {
+        input = document.createElement('input');
+        if (spec.kind === 'int' || spec.kind === 'float') {
+          input.type = 'number';
+          input.step = spec.kind === 'float' ? '0.01' : '1';
+          if (spec.min !== undefined) input.min = spec.min;
+          if (spec.max !== undefined) input.max = spec.max;
+        } else {
+          input.type = 'text';
+        }
+        input.value = data.values[spec.key] || '';
+      }
+      input.dataset.key = spec.key;
+      input.dataset.init = input.value;
+      row.appendChild(input);
+      if (spec.help) {
+        const help = document.createElement('div');
+        help.className = 'help';
+        help.textContent = spec.help;
+        row.appendChild(help);
+      }
+      body.appendChild(row);
+    }
+    details.appendChild(body);
+    box.appendChild(details);
+  }
+
+  box.querySelectorAll('input, select, textarea').forEach((el) => {
+    const mark = () => { cfgDirty = true; cfgSay('有未保存的修改，点「保存并生效」', ''); };
+    el.addEventListener('input', mark);
+    el.addEventListener('change', mark);
+  });
+}
+
+async function saveConfig() {
+  const values = {};
+  document.querySelectorAll('#cfg-groups [data-key]').forEach((el) => {
+    if (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') {
+      if (el.dataset.init === undefined || el.value !== el.dataset.init) {
+        values[el.dataset.key] = el.value;
+      }
+    }
+  });
+  const talk_values = {};
+  document.querySelectorAll('#cfg-talk [data-gid]').forEach((el) => {
+    if (el.dataset.init === undefined || el.value !== el.dataset.init) {
+      talk_values[el.dataset.gid] = el.value;
+    }
+  });
+  if (!Object.keys(values).length && !Object.keys(talk_values).length) {
+    cfgSay('没有任何改动，无需保存', 'ok');
+    return;
+  }
+  cfgSay('正在保存并热重载…', '');
+  try {
+    const resp = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values, talk_values }),
+    });
+    const data = await resp.json();
+    if (!data.ok) { cfgSay('保存失败：' + (data.error || '未知错误'), 'err'); return; }
+    const st = Object.entries(data.reloaded || {})
+      .map((entry) => entry[0] + (entry[1].ok ? ' 已重载' : ' 重载失败')).join(' · ');
+    const summary = data.at + ' · 改了 ' + data.changed.length + ' 项、'
+      + data.talk_changed.length + ' 个群档位 · ' + st;
+    cfgDirty = false;
+    await loadConfig();
+    cfgSay(summary, data.reload_ok ? 'ok' : 'err');
+  } catch (err) {
+    cfgSay('保存失败：' + err.message, 'err');
+  }
+}
+
+document.getElementById('cfg-save').onclick = saveConfig;
+document.getElementById('cfg-refresh').onclick = () => {
+  if (cfgDirty && !confirm('有未保存的修改，确定放弃吗？')) return;
+  loadConfig();
+};
+document.getElementById('cfg-restart').onclick = async () => {
+  if (!confirm('强制重启会清空她正在观察的群聊上下文，确定吗？')) return;
+  cfgSay('正在重启服务…', '');
+  try {
+    const resp = await fetch('/api/restart', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    const data = await resp.json();
+    cfgSay(data.ok ? '已重启 gemini-fish 与 gemini-fish-qq'
+      : ('重启失败：' + (data.output || '')), data.ok ? 'ok' : 'err');
+    setTimeout(loadConfig, 1800);
+  } catch (err) {
+    cfgSay('重启失败：' + err.message, 'err');
+  }
+};
+document.getElementById('cfg-search').addEventListener('input', (event) => {
+  const needle = event.target.value.trim().toLowerCase();
+  document.querySelectorAll('#cfg-groups .cfg-row').forEach((row) => {
+    row.hidden = !!needle && !row.textContent.toLowerCase().includes(needle);
+  });
+  document.querySelectorAll('#cfg-groups details.grp').forEach((details) => {
+    if (needle) details.open = true;
+  });
+});
+
 initTabs();
 restartTimer();
 </script>
@@ -433,6 +1061,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "unauthorized"}, 401)
             return
 
+        if parsed.path == "/api/config":
+            self._json(config_snapshot())
+            return
+
         if parsed.path == "/api/sources":
             self._json({
                 "ok": True,
@@ -464,6 +1096,42 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        self._json({"ok": False, "error": "not found"}, 404)
+
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        if not (auth_ok(self._cookie()) or auth_ok((query.get("token") or [""])[0])):
+            self._json({"ok": False, "error": "unauthorized"}, 401)
+            return
+        if "application/json" not in (self.headers.get("Content-Type") or ""):
+            self._json({"ok": False, "error": "需要 application/json"}, 400)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 200000:
+            self._json({"ok": False, "error": "请求体为空或过大"}, 400)
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._json({"ok": False, "error": "JSON 格式错误"}, 400)
+            return
+        if not isinstance(body, dict):
+            self._json({"ok": False, "error": "JSON 顶层必须是对象"}, 400)
+            return
+        if parsed.path == "/api/config":
+            try:
+                self._json(save_config(body))
+            except Exception as exc:  # noqa: BLE001
+                self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
+            return
+        if parsed.path == "/api/restart":
+            self._json(restart_services())
+            return
         self._json({"ok": False, "error": "not found"}, 404)
 
 

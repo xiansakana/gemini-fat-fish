@@ -29,7 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from server import CFG, ROOT  # noqa: E402
+from server import CFG, ENV_FILE, ROOT, load_config  # noqa: E402
 
 LOG_DIR = ROOT / "logs"
 DATA_DIR = ROOT / "data"
@@ -75,6 +75,49 @@ def parse_list(key: str) -> list[str]:
 
 def group_whitelist() -> set[str]:
     return set(parse_list("QQ_GROUP_WHITELIST"))
+
+
+def reload_runtime_config() -> dict:
+    """不重启进程，重新读 .env，让配置页保存后立刻生效。"""
+    fresh = load_config()
+    CFG.clear()
+    CFG.update(fresh)
+    _group_talk_value.clear()
+    groups = sorted(known_groups())
+    return {
+        "ok": True,
+        "whitelist": groups,
+        "talk_value": {gid: get_talk_value(gid) for gid in groups},
+        "threshold": {gid: dynamic_threshold(gid) for gid in groups},
+        "chatty": chatty_mode(),
+    }
+
+
+def auto_whitelist() -> bool:
+    """被拉进新群时自动放行，省得每次手改 .env。"""
+    return cfg("QQ_AUTO_WHITELIST", "1").lower() not in ("0", "false", "no", "off")
+
+
+def add_to_whitelist(group_id: str) -> bool:
+    """把群号写进 .env 的白名单，同时刷新内存里的配置。"""
+    group_id = str(group_id)
+    current = [item for item in re.split(r"[,，\s]+", cfg("QQ_GROUP_WHITELIST")) if item]
+    if group_id in current:
+        return False
+    current.append(group_id)
+    value = ",".join(current)
+    try:
+        text = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else ""
+        if re.search(r"(?m)^QQ_GROUP_WHITELIST=", text):
+            text = re.sub(r"(?m)^QQ_GROUP_WHITELIST=.*$", f"QQ_GROUP_WHITELIST={value}", text)
+        else:
+            text = text.rstrip("\n") + f"\nQQ_GROUP_WHITELIST={value}\n"
+        ENV_FILE.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        log_line(f"[白名单] 写入失败 {type(exc).__name__} {exc}")
+    CFG["QQ_GROUP_WHITELIST"] = value
+    log_line(f"[白名单] 自动加入 {group_id} | 现在：{value}")
+    return True
 
 
 def group_allowed(group_id: str) -> bool:
@@ -1327,9 +1370,10 @@ def handle_notice(event: dict) -> dict:
     notice_type = event.get("notice_type")
     join_types = ("group_increase", "group_member_increase", "group_member_join")
 
-    # 自己被拉进新群：先把能拿到的历史补上，新群也要先看一会儿再说话
     # 自己被拉进新群：补历史、读群资料，空群再打个招呼
     if notice_type in join_types and str(event.get("user_id")) == cfg("QQ_BOT_QQ") and cfg("QQ_BOT_QQ"):
+        if auto_whitelist():
+            add_to_whitelist(group_id)
         threading.Thread(target=on_bot_joined, args=(group_id,), daemon=True).start()
         log_line(f"[进群] {group_id} | 自己被拉进群，开始补历史")
         return {"ok": True, "reason": "自己进群，开始补历史", "group_id": group_id}
@@ -1556,6 +1600,8 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         if group_id not in _backfilled and group_allowed(group_id):
             threading.Thread(target=backfill_group, args=(group_id,), daemon=True).start()
 
+    if group and auto_whitelist() and not group_allowed(group_id) and str(event.get("user_id")) != cfg("QQ_BOT_QQ"):
+        add_to_whitelist(group_id)
     reply_to_bot = is_reply_to_bot(reply_id)
     engage, reason = should_engage(event, text, at_self, reply_to_bot)
     if not engage:
@@ -1871,6 +1917,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/api/reload":
+            self._json(reload_runtime_config())
+            return
         if self.path == "/onebot":
             event = self._body()
             # OneBot 要求快速返回，处理放后台线程
