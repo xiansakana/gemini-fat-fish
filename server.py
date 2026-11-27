@@ -76,7 +76,10 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "browse",
-        "description": "打开一个网址并返回页面纯文本。JS 站点会自动开无头浏览器渲染。",
+        "description": (
+            "打开一个网址并返回页面纯文本。JS 站点会自动开无头浏览器渲染。"
+            "已知具体网址时用（比如对方发了链接）；只是想查资料时优先用 web_search。"
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -88,7 +91,12 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "web_search",
-        "description": "搜索当前网上的信息，返回标题、链接和摘要。查新闻、资料、不确定的事时用。",
+        "description": (
+            "搜索当前网上的实时信息，返回标题、链接和摘要。"
+            "当对方明确要求查行情、查新闻、查价格、查资料，或问到你不确定的实时信息时，"
+            "必须先用这个工具拿到真实结果再回答，不要凭记忆编造。"
+            "关键词要具体（如“上证指数 今日收盘”），一次就够了。"
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -984,8 +992,10 @@ def call_gemini(
                 except Exception as exc:  # noqa: BLE001
                     result = "工具出错：" + type(exc).__name__ + " " + str(exc)[:200]
             events.append({"name": name, "args": args, "result": result[:400]})
+            # 借鉴 AstrBot：工具结果先裁剪再进上下文，防止长结果稀释模型注意力
+            trimmed = result if len(result) <= 1200 else result[:1200] + "……（结果太长已截断，用已有信息回答即可）"
             function_parts.append(
-                {"functionResponse": {"name": name, "response": {"result": result}}}
+                {"functionResponse": {"name": name, "response": {"result": trimmed}}}
             )
         contents.append({"role": "user", "parts": function_parts})
 
