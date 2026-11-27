@@ -209,6 +209,7 @@ curl -X POST http://127.0.0.1:8767/simulate -H "Content-Type: application/json" 
 | `QQ_CONTEXT_PROBE_WINDOW` | 180 | 她刚说完多久内做上下文判定（秒） |
 | `QQ_CONTEXT_PROBE_GAP` | 12 | 同一群两次上下文判定最短间隔（秒，省 token） |
 | `QQ_STICKER_RATE` | 0.08 | 群聊回复附表情差分的概率，0 = 关闭 |
+| `TZ_OFFSET` | 空 | 她眼里的时区偏移（小时）；填 `8` 即 UTC+8，留空跟随系统 |
 | `QQ_VISION` | 1 | 被直接叫到时，把图片 / 视频也送进模型 |
 | `QQ_VISION_MAX_IMAGES` | 3 | 单条消息最多带几张图 |
 | `QQ_VISION_VIDEO_MB` | 20 | 视频原文件上限（MB），超过放弃 |

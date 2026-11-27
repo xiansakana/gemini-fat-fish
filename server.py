@@ -105,6 +105,8 @@ DEFAULTS = {
     "QQ_CONTEXT_PROBE_GAP": "12",
     # 群聊回复时随消息附一张表情差分的概率
     "QQ_STICKER_RATE": "0.08",
+    # 她眼里的时区：留空跟随系统，填 8 表示 UTC+8
+    "TZ_OFFSET": "",
     # 图片 / 视频理解：被直接叫到时才把媒体送进模型
     "QQ_VISION": "1",
     "QQ_VISION_MAX_IMAGES": "3",
@@ -223,9 +225,23 @@ def save_memory(mem: dict, session: str = "web") -> None:
     )
 
 
+def local_now() -> time.struct_time:
+    """她眼里的当地时间。
+
+    TZ_OFFSET 为空时跟随系统时区；填 8 就强制按 UTC+8，换机器也不会答错时间。
+    """
+    raw = str(CFG.get("TZ_OFFSET") or "").strip()
+    if raw:
+        try:
+            return time.gmtime(time.time() + float(raw) * 3600)
+        except ValueError:
+            pass
+    return time.localtime()
+
+
 def time_context() -> tuple[str, str]:
     """返回（时段名，完整时间文本）。"""
-    now = time.localtime()
+    now = local_now()
     hour, minute = now.tm_hour, now.tm_min
     if hour < 5:
         period = "凌晨"
@@ -1189,7 +1205,7 @@ def should_proactive(mem: dict, interval: int, now: float | None = None) -> bool
     last_pro = int(mem.get("last_proactive_ts", 0) or 0)
     if last_pro > last_chat and last_pro > 0:
         return False
-    if time.localtime(now).tm_hour < 7 and now - last_chat > 7200:
+    if local_now().tm_hour < 7 and now - last_chat > 7200:
         return False
     return now - max(last_chat, last_pro) >= interval
 
