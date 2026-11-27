@@ -136,6 +136,11 @@ def is_dry() -> bool:
     return bool(getattr(_force_dry, "value", False)) or not bool(onebot_api())
 
 
+def bridge_host() -> str:
+    """默认只听本机；容器里的 NapCat 上报需要改成 0.0.0.0 或 docker 网关地址。"""
+    return cfg("QQ_BRIDGE_HOST", "127.0.0.1").strip() or "127.0.0.1"
+
+
 def core_url() -> str:
     return cfg("QQ_CORE", "http://127.0.0.1:8766").rstrip("/")
 
@@ -788,7 +793,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     port = int(cfg("QQ_BRIDGE_PORT", "8767"))
-    print(f"QQ 桥已启动：http://127.0.0.1:{port}", flush=True)
+    host = bridge_host()
+    print(f"QQ 桥已启动：http://{host}:{port}", flush=True)
     print(f"核心：{core_url()}", flush=True)
     print(f"OneBot：{onebot_api() or '未配置（干跑模式，只打印不发送）'}", flush=True)
     print(f"群白名单：{sorted(group_whitelist()) or '空（不会回任何群）'}", flush=True)
@@ -800,7 +806,7 @@ def main() -> None:
     )
     if observe_enabled():
         threading.Thread(target=observe_loop, daemon=True).start()
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
