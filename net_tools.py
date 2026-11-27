@@ -12,9 +12,12 @@ import html as html_lib
 import ipaddress
 import json
 import re
+import shutil
 import socket
 import subprocess
+import tempfile
 import threading
+import time
 import urllib.parse
 import zlib
 import urllib.request
@@ -24,6 +27,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 BROWSER_LOCK = threading.Lock()
+SEARCH_CACHE: dict[str, tuple[float, str]] = {}
 MAX_BYTES = 600_000
 
 
@@ -101,38 +105,42 @@ def strip_html(raw: str) -> str:
 
 
 def search_web(query: str, limit: int = 5) -> str:
-    """Bing 网页搜索，返回标题 / 链接 / 摘要。"""
+    """先查 DuckDuckGo，拿不到再用真浏览器搜 Bing。"""
     query = str(query or "").strip()[:200]
     if not query:
         return "要搜什么？给个关键词。"
     limit = max(1, min(8, int(limit or 5)))
-    url = "https://www.bing.com/search?" + urllib.parse.urlencode(
-        {"q": query, "setlang": "zh-Hans", "count": limit, "mkt": "zh-CN"}
-    )
-    if not _safe_url(url):
-        return "这个搜索地址不通。"
-    items = _search_bing(query, url, limit)
+    cached = SEARCH_CACHE.get(query)
+    if cached and time.time() - cached[0] < 600:
+        return cached[1]
+    items = _search_ddg(query, limit)
     if not items:
-        items = _search_ddg(query, limit)
+        items = _search_bing_rendered(query, limit)
     if not items:
-        return f"没搜到「{query}」的结果。"
-    return f"搜索「{query}」的结果：\n" + "\n".join(items)
+        return f"没搜到「{query}」的结果，可能被限流了，等会儿再试。"
+    result = f"搜索「{query}」的结果：\n" + "\n".join(items)
+    SEARCH_CACHE[query] = (time.time(), result)
+    if len(SEARCH_CACHE) > 40:
+        for key in sorted(SEARCH_CACHE, key=lambda k: SEARCH_CACHE[k][0])[:10]:
+            SEARCH_CACHE.pop(key, None)
+    return result
 
 
-def _search_bing(query: str, url: str, limit: int) -> list[str]:
-    try:
-        page = _decode(_http_get(url))
-    except Exception:  # noqa: BLE001
+def _search_bing_rendered(query: str, limit: int) -> list[str]:
+    """纯 HTTP 会被 Bing 塞垃圾结果，真浏览器渲染才靠谱。"""
+    url = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": query})
+    dom = render_url(url, timeout=45)
+    if len(dom) < 2000:
         return []
     items: list[str] = []
-    for block in re.findall(r'<li class="b_algo".*?</li>', page, flags=re.S)[:limit * 2]:
+    for block in re.findall(r'<li class="b_algo".*?</li>', dom, flags=re.S)[:limit * 2]:
         link = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, flags=re.S)
         if not link:
             continue
         title = strip_html(link.group(2))[:120]
         href = html_lib.unescape(link.group(1))
         snippet = re.search(r"<p[^>]*>(.*?)</p>", block, flags=re.S)
-        summary = strip_html(snippet.group(1))[:220].replace("阅读更多", "").strip()
+        summary = strip_html(snippet.group(1))[:220].replace("阅读更多", "").strip() if snippet else ""
         items.append(f"{len(items) + 1}. {title}\n   {href}\n   {summary}")
         if len(items) >= limit:
             break
@@ -159,12 +167,15 @@ def render_url(url: str, timeout: int = 40) -> str:
     """用无头 Chromium 渲染 JS 页面，拿渲染后的文本。"""
     if not _safe_url(url):
         return "这个地址不允许访问。"
+    profile = tempfile.mkdtemp(prefix="fish-chrome-")
     command = [
         "chromium", "--headless", "--no-sandbox", "--disable-gpu",
         "--disable-dev-shm-usage", "--hide-scrollbars", "--mute-audio",
+        "--user-data-dir", profile,
         "--user-agent", UA, "--virtual-time-budget=8000", "--dump-dom", url,
     ]
     if not BROWSER_LOCK.acquire(timeout=15):
+        shutil.rmtree(profile, ignore_errors=True)
         return "浏览器正忙，稍后再试。"
     try:
         done = subprocess.run(
@@ -174,6 +185,7 @@ def render_url(url: str, timeout: int = 40) -> str:
         return "页面渲染超时。"
     finally:
         BROWSER_LOCK.release()
+        shutil.rmtree(profile, ignore_errors=True)
     dom = done.stdout.decode("utf-8", "replace")
     if not dom:
         return "页面没渲染出内容。"
