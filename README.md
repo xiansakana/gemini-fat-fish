@@ -212,6 +212,11 @@ curl -X POST http://127.0.0.1:8767/simulate -H "Content-Type: application/json" 
 | `QQ_CONTEXT_PROBE_GAP` | 12 | 同一群两次上下文判定最短间隔（秒，省 token） |
 | `QQ_STICKER_RATE` | 0.08 | 群聊回复附表情差分的概率，0 = 关闭 |
 | `TZ_OFFSET` | 空 | 她眼里的时区偏移（小时）；填 `8` 即 UTC+8，留空跟随系统 |
+| `QQ_CHATTY` | 0 | 话痨模式：观察评估放宽、过线就说，不再只挑感兴趣的话题 |
+| `QQ_CHATTY_HINT` | 空 | 话痨模式追加的风格提示，留空则用原人设 |
+| `QQ_THRESHOLD_MIN` | 3 | 阈值下限，话痨模式可以降到 2 |
+| `QQ_OBSERVE_MIN_SPEAKERS` | 2 | 至少几个人说话才评估，话痨可设 1 |
+| `QQ_SPLIT_PARTS` | 2 | 一条回复最多拆成几条消息，话痨可设 3 |
 | `QQ_GROUP_WEB` | 1 | 群聊里是否开放只读联网工具（搜索 / 网页 / B站） |
 | `SURF_ENABLED` | 1 | 是否让她自己定时刷 B 站 |
 | `SURF_INTERVAL_MINUTES` | 180 | 多久刷一次 |
