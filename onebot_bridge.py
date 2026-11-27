@@ -35,6 +35,8 @@ DATA_DIR = ROOT / "data"
 BUDGET_FILE = DATA_DIR / "qq_budget.json"
 BOT_MESSAGES_FILE = DATA_DIR / "qq_bot_messages.json"
 TALK_VALUE_FILE = DATA_DIR / "qq_talk_value.json"
+PROFILE_FILE = DATA_DIR / "qq_profiles.json"
+PERSONA_FILE = DATA_DIR / "qq_personas.json"
 
 CORE_TIMEOUT = 90
 _reply_lock = threading.Lock()
@@ -326,6 +328,88 @@ def dynamic_threshold(group_id: str) -> int:
     return max(3, min(9, int(round(base))))
 
 
+def profile_key(group_id: str, user_id) -> str:
+    return f"group_{group_id}:{user_id}"
+
+
+def ask_profile(messages: list[dict]) -> list[str]:
+    payload = json.dumps({"messages": messages}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        core_url() + "/api/profile",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.load(response)
+        return [str(x) for x in (data.get("facts") or [])][:5]
+    except Exception as exc:  # noqa: BLE001
+        log_line(f"画像抽取失败 {type(exc).__name__} {exc}")
+        return []
+
+
+def update_profile(group_id: str, user_id, speaker: str, text: str, ts: float) -> None:
+    key = profile_key(group_id, user_id)
+    data = load_json(PROFILE_FILE, {})
+    entry = dict(data.get(key) or {})
+    entry["nickname"] = str(speaker)[:20]
+    entry["messages"] = int(entry.get("messages", 0)) + 1
+    entry["last"] = ts
+    alias = re.search(r"叫我(.{1,12})", text)
+    if alias:
+        entry["alias"] = alias.group(1).strip("，。！？ ")
+    facts = [str(x) for x in (entry.get("facts") or [])]
+
+    if entry["messages"] - int(entry.get("since_extract", 0)) >= 15:
+        mine = [
+            {"text": item.get("text", "")}
+            for item in _group_buffer.get(group_id, [])
+            if str(item.get("speaker")) == str(speaker)
+        ][-12:]
+        if mine:
+            extracted = ask_profile(mine)
+            for fact in extracted:
+                if fact and fact not in facts:
+                    facts.append(fact)
+            del facts[:-15]
+            log_line(f"[画像] {group_id} | {speaker} | 新增 {len(extracted)} 条")
+        entry["since_extract"] = entry["messages"]
+
+    entry["facts"] = facts
+    data[key] = entry
+    save_json(PROFILE_FILE, data)
+
+
+def build_profile_context(group_id: str) -> str:
+    data = load_json(PROFILE_FILE, {})
+    names = []
+    for item in reversed(_group_buffer.get(group_id, [])[-20:]):
+        name = item.get("speaker")
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= 3:
+            break
+    lines = []
+    for name in names:
+        for key, entry in data.items():
+            if not key.startswith(f"group_{group_id}:") or entry.get("nickname") != name:
+                continue
+            facts = [str(x) for x in (entry.get("facts") or [])][:3]
+            alias = entry.get("alias")
+            label = f"{name}（聊过 {entry.get('messages', 0)} 次" + (f"，想被叫 {alias}" if alias else "") + "）"
+            if facts:
+                label += "：" + "；".join(facts)
+            lines.append(label)
+            break
+    return "\n".join(lines)
+
+
+def group_persona(group_id: str) -> str:
+    data = load_json(PERSONA_FILE, {})
+    return str(data.get(group_id) or "").strip()
+
+
 def ask_observe(messages: list[dict], probe: str = "") -> dict:
     payload = json.dumps({"messages": messages, "probe": probe}, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
@@ -534,9 +618,16 @@ def split_reply(text: str, limit: int = 2) -> list[str]:
     return [part[:400] for part in parts[:limit]]
 
 
-def ask_core(text: str, session: str, channel: str, speaker: str) -> tuple[str, str | None]:
+def ask_core(
+    text: str, session: str, channel: str, speaker: str,
+    profile: str = "", persona_override: str = "",
+) -> tuple[str, str | None]:
     payload = json.dumps(
-        {"message": text, "session": session, "channel": channel, "speaker": speaker},
+        {
+            "message": text, "session": session, "channel": channel,
+            "speaker": speaker, "profile": profile,
+            "persona_override": persona_override,
+        },
         ensure_ascii=False,
     ).encode("utf-8")
     request = urllib.request.Request(
@@ -633,6 +724,18 @@ def handle_group_command(group_id: str, user_id, text: str) -> dict | None:
     elif text.startswith("/normal"):
         set_talk_value(group_id, 1.0)
         reply = "恢复平常。"
+    elif text.startswith("/人设"):
+        persona = text[3:].strip()
+        data = load_json(PERSONA_FILE, {})
+        if persona in ("清除", "默认", "reset"):
+            data.pop(group_id, None)
+            reply = "这个群的人设恢复默认了。"
+        elif persona:
+            data[group_id] = persona[:2000]
+            reply = "记住了，这个群就按这个人设来。"
+        else:
+            return None
+        save_json(PERSONA_FILE, data)
     else:
         return None
     send_group_parts(group_id, [reply])
@@ -677,6 +780,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
     # 不回复也记下来，观察循环要靠这些上下文判断气氛
     if group and group_id and str(event.get("user_id")) != cfg("QQ_BOT_QQ"):
         record_group_message(group_id, display_name(event), text)
+        update_profile(group_id, user_id, speaker, text, time.time())
 
     reply_to_bot = is_reply_to_bot(reply_id)
     engage, reason = should_engage(event, text, at_self, reply_to_bot)
@@ -711,8 +815,12 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         return {"ok": False, "reason": "今日预算用完"}
 
     prompt = f"{speaker}：{text}" if group else text
+    profile_context = build_profile_context(group_id) if group else ""
+    persona = group_persona(group_id) if group else ""
     with _reply_lock:
-        reply, error = ask_core(prompt, session, channel, speaker)
+        reply, error = ask_core(
+            prompt, session, channel, speaker, profile_context, persona
+        )
 
     if error or not reply:
         log_line(f"{session} | {speaker} | {text} | 调用失败: {error}")
@@ -722,7 +830,9 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         log_line(f"[去重] {group_id} | 原回复太像：{reply[:60]}")
         retry_prompt = prompt + "\n（刚才你说过很相近的话，这次换个说法，别重复。）"
         with _reply_lock:
-            retry, retry_error = ask_core(retry_prompt, session, channel, speaker)
+            retry, retry_error = ask_core(
+                retry_prompt, session, channel, speaker, profile_context, persona
+            )
         if retry and not retry_error:
             reply = retry
 
@@ -931,6 +1041,11 @@ class Handler(BaseHTTPRequestHandler):
                             "talk_value": get_talk_value(gid),
                             "threshold": dynamic_threshold(gid),
                             "recent_replies": len(_group_recent_replies.get(gid, [])),
+                            "profiles": len([
+                                k for k in load_json(PROFILE_FILE, {})
+                                if k.startswith(f"group_{gid}:")
+                            ]),
+                            "persona": bool(group_persona(gid)),
                         }
                         for gid in sorted(group_whitelist())
                     }
