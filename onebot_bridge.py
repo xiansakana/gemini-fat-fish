@@ -738,16 +738,25 @@ def intro_context(group_id: str) -> str:
     return "\n".join(lines)
 
 
-def backfill_group(group_id: str, limit: int | None = None, force: bool = False) -> dict:
-    """进群或第一次见到某个群时，把能拿到的历史灌进上下文、画像和摘要。"""
+def backfill_group(
+    group_id: str, limit: int | None = None, force: bool = False, warmup: bool | None = None
+) -> dict:
+    """进群或第一次见到某个群时，把能拿到的历史灌进上下文、画像和摘要。
+
+    warmup 为 None 时只在第一次见到这个群才潜水，重启后的补数据不会让她闭嘴。
+    """
     group_id = str(group_id)
     now = time.time()
     with _observe_lock:
         done_at = float(_backfilled.get(group_id, 0.0))
         if done_at and not force and now - done_at < 6 * 3600:
             return {"ok": False, "reason": "六小时内补过", "group_id": group_id}
+        first_time = not done_at
         _backfilled[group_id] = now
-        _group_warmup[group_id] = now + group_warmup()
+        if warmup is None:
+            warmup = first_time
+        if warmup:
+            _group_warmup[group_id] = now + group_warmup()
     save_json(BACKFILL_FILE, {gid: int(ts) for gid, ts in _backfilled.items()})
 
     intro = refresh_group_intro(group_id)
@@ -1145,7 +1154,9 @@ def handle_notice(event: dict) -> dict:
 
     # 自己被拉进新群：先把能拿到的历史补上，新群也要先看一会儿再说话
     if notice_type in join_types and str(event.get("user_id")) == cfg("QQ_BOT_QQ") and cfg("QQ_BOT_QQ"):
-        threading.Thread(target=backfill_group, args=(group_id,), daemon=True).start()
+        threading.Thread(
+            target=backfill_group, args=(group_id,), kwargs={"warmup": True}, daemon=True
+        ).start()
         log_line(f"[进群] {group_id} | 自己被拉进群，开始补历史")
         return {"ok": True, "reason": "自己进群，开始补历史", "group_id": group_id}
 
