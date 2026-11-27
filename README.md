@@ -98,7 +98,7 @@ QQ ←→ NapCat / LLOneBot（OneBot v11）
 
 1. 启动核心：`python server.py`
 2. 在 `.env` 填 `QQ_BOT_QQ`、`QQ_GROUP_WHITELIST`、`QQ_PRIVATE_WHITELIST`，`QQ_ONEBOT_API` 先留空（干跑模式）
-3. `python onebot_bridge.py`，用 `/simulate` 灌几条消息确认判定；没问题后把 `QQ_ONEBOT_API` 指向 NapCat 的 HTTP API，并在 NapCat 把 HTTP 上报地址设为 `http://127.0.0.1:8767/onebot`
+3. `python onebot_bridge.py`，用 `/simulate` 灌几条消息确认判定；没问题后把 `QQ_ONEBOT_API` 指向 NapCat 的 HTTP API，并在 NapCat 把 HTTP 上报地址设为 `http://127.0.0.1:8767/onebot`（若 NapCat 在 Docker 里，填 `http://host.docker.internal:8767/onebot`，同时把 `QQ_BRIDGE_HOST` 设为 `0.0.0.0` 并限制来源）
 
 ### 群聊规则
 
@@ -170,6 +170,9 @@ curl -X POST http://127.0.0.1:8767/simulate -H "Content-Type: application/json" 
 | `EVOLVE_OUTPUT_TOKENS` | 320 | 反思输出上限 |
 | `PROACTIVE_MINUTES` | 45 | 多久没聊天后主动发一句 |
 | `QQ_ONEBOT_API` | 空 | OneBot 的 HTTP API 地址；留空为干跑模式 |
+| `QQ_CORE` | `http://127.0.0.1:8766` | 桥要调用的核心服务地址 |
+| `QQ_BRIDGE_PORT` | 8767 | 桥接服务端口 |
+| `QQ_BRIDGE_HOST` | `127.0.0.1` | 桥监听地址；NapCat 跑在 Docker 里时需填 `0.0.0.0`，并只放行本机 + docker 网段 |
 | `QQ_BOT_QQ` | 空 | 机器人自己的 QQ 号，用来识别 @ |
 | `QQ_GROUP_WHITELIST` | 空 | 允许的群号，逗号分隔；空 = 不响应任何群 |
 | `QQ_PRIVATE_WHITELIST` | 空 | 允许的私聊 QQ，逗号分隔；空 = 不响应任何私聊 |

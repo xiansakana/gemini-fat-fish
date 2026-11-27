@@ -78,6 +78,23 @@ curl -s http://127.0.0.1:8766/api/state | head -c 300
 curl -s http://127.0.0.1:8767/health
 ```
 
+## 入站上报（重要）
+
+NapCat 在 Docker 里，容器访问宿主机的 `host.docker.internal` 会解析到 docker 网关 `172.17.0.1`。早期桥只监听 `127.0.0.1:8767`，NapCat 日志报 `connect ECONNREFUSED 172.17.0.1:8767`，群里真实消息**根本没进桥**——只有 `/simulate` 手动灌的消息有反应。
+
+现在的做法：
+
+- 服务器 `.env` 设 `QQ_BRIDGE_HOST=0.0.0.0`，桥监听所有地址，`127.0.0.1` 仍可用。
+- 用 iptables 只放行本机和 docker 网段，其余来源直接丢：
+
+```bash
+sudo iptables -I INPUT -p tcp --dport 8767 -s 127.0.0.0/8 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 8767 -s 172.16.0.0/12 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8767 -j DROP
+```
+
+验证：`docker exec napcat curl http://host.docker.internal:8767/health` 应返回 JSON，群里真实 @ 后日志应出现该条消息。
+
 ## 群聊观察配置
 
 桥每 3 秒检查白名单群：攒够 `QQ_OBSERVE_MIN_MESSAGES` 条新消息、距上次评估超过 `QQ_OBSERVE_INTERVAL` 秒、且至少两个人说过话，才调一次 `/api/observe`。激活度达到 `QQ_OBSERVE_THRESHOLD` 才发言，发言后 `QQ_OBSERVE_COOLDOWN` 秒内不再主动开口。评估不写会话记忆。
