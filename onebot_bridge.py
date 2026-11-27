@@ -745,13 +745,17 @@ def fetch_group_history(group_id: str, limit: int | None = None) -> list[dict]:
                 continue
             collected[key] = raw
             fresh += 1
-        seqs = [
-            int(item["message_seq"]) for item in messages
-            if isinstance(item, dict) and item.get("message_seq") is not None
+        timed = [
+            item for item in messages
+            if isinstance(item, dict)
+            and item.get("message_seq") is not None
+            and item.get("time")
         ]
-        if not seqs or fresh == 0 or len(collected) >= want:
+        if not timed or fresh == 0 or len(collected) >= want:
             break
-        seq = min(seqs)
+        # message_seq 是与时间无关的消息 ID，min(seq) 选不出最旧的一条，
+        # 翻页会停在第一页；必须按 time 找最旧的消息，拿它的 seq 当游标。
+        seq = int(min(timed, key=lambda item: float(item["time"]))["message_seq"])
     ordered = sorted(collected.values(), key=lambda item: float(item.get("time") or 0))
     return ordered[-want:]
 
