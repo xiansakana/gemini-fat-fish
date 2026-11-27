@@ -499,6 +499,43 @@ def update_profile(group_id: str, user_id, speaker: str, text: str, ts: float) -
     save_json(PROFILE_FILE, data)
 
 
+def build_style_context(group_id: str) -> str:
+    """看这个群平时怎么说话，让她跟着同样的节奏，而不是自带一套书面语。"""
+    texts = [
+        str(item.get("text") or "")
+        for item in _group_buffer.get(group_id, [])[-100:]
+        if item.get("text") and not str(item.get("text")).startswith("[")
+    ]
+    texts = [text for text in texts if len(text) >= 1]
+    if len(texts) < 10:
+        return ""
+    lens = [len(text) for text in texts]
+    total = len(texts)
+    avg = sum(lens) / total
+    short = sum(1 for length in lens if length <= 8) / total
+    question = sum(1 for text in texts if text.rstrip().endswith(("？", "?"))) / total
+    period = sum(1 for text in texts if text.rstrip().endswith("。")) / total
+    emoji = sum(
+        1 for text in texts
+        if re.search(r"[😀-🙏😂🤣😅😭🥲👍🤔🙏]|\[表情\]|\[图片\]", text)
+    ) / total
+    lines = [
+        f"这个群最近 {total} 条消息：平均每条 {avg:.0f} 字，{short:.0%} 不到 8 个字；"
+        f"问句 {question:.0%}，句号收尾 {period:.0%}，带表情 {emoji:.0%}。"
+    ]
+    if avg <= 14 or short >= 0.5:
+        lines.append("大家说话很短很碎，你也按这个来：一条别超过 15 字，想说的拆成两三条。")
+    elif avg <= 28:
+        lines.append("群里句子偏短，你一条控制在 25 字以内，别写成一段。")
+    else:
+        lines.append("群里偶尔会长一点，但也是口语；你不用写书面语。")
+    if period <= 0.25:
+        lines.append("很少有人用句号收尾，你也别每句都打句号。")
+    if emoji <= 0.1:
+        lines.append("群里很少用表情，你也少用。")
+    return "\n".join(lines)
+
+
 def build_profile_context(group_id: str) -> str:
     data = load_json(PROFILE_FILE, {})
     names = []
@@ -1087,33 +1124,78 @@ def clean_for_group(text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def _split_fragments(text: str, soft: int = 26, hard: int = 48) -> list[str]:
+    """按句子和逗号切成口语碎块，再合并到 soft 字左右。"""
+    text = re.sub(r"\s+", " ", text.strip())
+    if not text:
+        return []
+    raw = [piece.strip() for piece in re.split(r"(?<=[。！？!?…])", text) if piece.strip()]
+    pieces: list[str] = []
+    for piece in raw:
+        if len(piece) <= soft:
+            pieces.append(piece)
+            continue
+        for sub in re.split(r"(?<=[，,、；;])", piece):
+            sub = sub.strip()
+            if sub:
+                pieces.append(sub)
+    merged: list[str] = []
+    current = ""
+    for piece in pieces:
+        if not current:
+            current = piece
+        elif len(current) + len(piece) <= soft:
+            current += piece
+        else:
+            merged.append(current)
+            current = piece
+    if current:
+        merged.append(current)
+    return [piece for piece in merged if piece]
+
+
 def split_reply(text: str, limit: int = 0) -> list[str]:
+    """像真人一样一条条发：短句为主，偶尔才合成一条。"""
     limit = limit or _int_cfg("QQ_SPLIT_PARTS", 2, 1, 4)
     text = (text or "").strip()
     if not text:
         return []
-    parts = [part.strip() for part in re.split(r"\n+", text) if part.strip()]
-    if len(parts) == 1 and len(parts[0]) > 90:
-        sentences = re.split(r"(?<=[。！？!?])", parts[0])
-        merged, current = [], ""
-        for sentence in sentences:
-            if not sentence.strip():
-                continue
-            if len(current) + len(sentence) > 90 and current:
-                merged.append(current.strip())
-                current = sentence
-            else:
-                current += sentence
-        if current.strip():
-            merged.append(current.strip())
-        parts = merged
-    return [part[:400] for part in parts[:limit]]
+    parts = _split_fragments(text)
+    if not parts:
+        return []
+    while len(parts) > limit:
+        index = min(range(len(parts) - 1), key=lambda i: len(parts[i]) + len(parts[i + 1]))
+        parts[index:index + 2] = [parts[index] + parts[index + 1]]
+    parts = [re.sub(r"[，,、；;：:]+$", "", part).strip() for part in parts]
+    parts = [part for part in parts if part]
+    if len(parts) > 1 and len(text) <= 40 and random.random() < 0.25:
+        parts = ["".join(parts)]
+    return [part[:200] for part in parts]
+
+
+def typing_delay(text: str) -> float:
+    """按字数估一下“敲完这条要多久”，用于多条之间的停顿。"""
+    unit = _float_cfg("QQ_TYPING_MS", 90, 20, 400)
+    total = 0.0
+    for char in text:
+        if char.isspace():
+            total += unit * 0.15
+        elif ord(char) < 128:
+            total += unit * 0.5
+        else:
+            total += unit
+        if char in "。！？!?":
+            total += unit * 1.4
+        elif char in "，,、；;":
+            total += unit * 0.6
+    total *= random.uniform(0.8, 1.25)
+    return max(0.4, min(_float_cfg("QQ_TYPING_MAX", 6, 0.5, 30), total / 1000))
 
 
 def ask_core(
     text: str, session: str, channel: str, speaker: str,
     profile: str = "", persona_override: str = "", context: str = "",
-    media: list[dict] | None = None,
+    media: list[dict] | None = None, style: str = "",
 ) -> tuple[str, str | None]:
     payload = json.dumps(
         {
@@ -1121,6 +1203,7 @@ def ask_core(
             "speaker": speaker, "profile": profile,
             "persona_override": persona_override, "context": context,
             "media": media or [],
+            "style": style or "",
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -1205,7 +1288,7 @@ def send_group_parts(group_id: str, parts: list[str], reply_id: str | None = Non
     with _reply_lock:
         for index, segments in enumerate(messages):
             if index:
-                time.sleep(0.8)
+                time.sleep(typing_delay(parts[index - 1]))
             ok, message_id = call_onebot(
                 "send_group_msg", {"group_id": int(group_id), "message": segments}
             )
@@ -1534,6 +1617,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         reply, error = ask_core(
             prompt, session, channel, speaker,
             profile_context, persona, group_context, media,
+            build_style_context(group_id) if group else "",
         )
 
     if error or not reply:
@@ -1547,6 +1631,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
             retry, retry_error = ask_core(
                 retry_prompt, session, channel, speaker,
                 profile_context, persona, group_context, media,
+                build_style_context(group_id) if group else "",
             )
         if retry and not retry_error:
             reply = retry
@@ -1559,7 +1644,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         with _reply_lock:
             for index, part in enumerate(parts):
                 if index:
-                    time.sleep(0.8)
+                    time.sleep(typing_delay(parts[index - 1]))
                 sent, message_id = call_onebot(
                     "send_private_msg",
                     {
