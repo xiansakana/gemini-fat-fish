@@ -611,18 +611,40 @@ TOOL_DISPATCH = {
 }
 
 
+_model_failures: dict[str, list[float]] = {}
+
+
+def _model_degraded(name: str) -> bool:
+    """10 分钟内连挂 3 次的模型视为过载，调用时先走备用。"""
+    now = time.time()
+    fails = [t for t in _model_failures.get(name, []) if now - t < 600]
+    _model_failures[name] = fails
+    return len(fails) >= 3
+
+
 def gemini_post(
     payload: dict, timeout: int = 60, model: str | None = None
 ) -> tuple[dict | None, str | None]:
-    """先打主模型；遇到限流/繁忙/超时就自动切到备用模型。"""
+    """先打主模型；限流/繁忙/超时/5xx 就换备用模型再试一次。
+
+    主备相同（比如群聊和备用都是 flash-lite）时，自动拿另一档模型兜底，
+    保证任何场景都至少有两个模型可用；某个模型近期频繁失败就先试另一个。
+    """
     primary = str(model or CFG["GEMINI_MODEL"])
     fallback = str(CFG.get("GEMINI_FALLBACK_MODEL") or "").strip()
-    models = [primary]
-    if fallback and fallback != primary:
-        models.append(fallback)
+    if not fallback or fallback == primary:
+        core_model = str(CFG.get("GEMINI_MODEL") or "")
+        fallback = core_model if core_model and core_model != primary else ""
+        if not fallback and primary != "gemini-3.5-flash-lite":
+            fallback = "gemini-3.5-flash-lite"
+    models = [m for m in (primary, fallback) if m]
+    if len(models) > 1 and _model_degraded(primary):
+        models = models[::-1]
     version = CFG["GEMINI_API_VERSION"]
     last_error = "模型没回应"
+    last_model = primary
     for index, model in enumerate(models):
+        last_model = model
         url = (
             f"https://generativelanguage.googleapis.com/{version}/models/"
             f"{model}:generateContent"
@@ -638,17 +660,23 @@ def gemini_post(
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
+                _model_failures.pop(model, None)
                 return json.load(response), None
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             last_error = f"HTTP {exc.code}：{detail}"
-            if exc.code in (408, 429, 500, 502, 503, 504) and index < len(models) - 1:
-                continue
+            if exc.code in (408, 429, 500, 502, 503, 504):
+                # 借鉴 youtube-digest：每次限流/过载失败都计数（不只全链失败才算），
+                # 10 分钟窗口内挂满 3 次的模型会被后续调用自动垫底。
+                _model_failures.setdefault(model, []).append(time.time())
+                if index < len(models) - 1:
+                    continue
             return None, last_error
         except Exception as exc:  # noqa: BLE001
             last_error = f"{type(exc).__name__}：{exc}"
             if index < len(models) - 1:
                 continue
+            _model_failures.setdefault(model, []).append(time.time())
             return None, last_error
     return None, last_error
 
