@@ -931,13 +931,58 @@ def call_gemini(
     return "（工具绕太多圈了，先停一下）", usage_total, None, events
 
 
+def _repair_json_text(text: str) -> str:
+    """模型偶尔会在字符串里塞未转义的引号或换行，这里补一下再解析。"""
+    value = (text or "").strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```[a-zA-Z]*\s*", "", value)
+        value = re.sub(r"\s*```$", "", value)
+    start, end = value.find("{"), value.rfind("}")
+    if start >= 0 and end > start:
+        value = value[start:end + 1]
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", value)
+
+    out: list[str] = []
+    in_string = False
+    index = 0
+    length = len(value)
+    while index < length:
+        char = value[index]
+        if in_string and char == "\\" and index + 1 < length:
+            out.append(value[index:index + 2])
+            index += 2
+            continue
+        if char == '"':
+            if not in_string:
+                in_string = True
+                out.append(char)
+            else:
+                look = index + 1
+                while look < length and value[look] in " \t\r\n":
+                    look += 1
+                if look < length and value[look] in ",:}]":
+                    in_string = False
+                    out.append(char)
+                else:
+                    out.append('\\"')
+            index += 1
+            continue
+        if in_string and char in "\r\n":
+            out.append("\\n")
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+    value = "".join(out)
+    return re.sub(r",\s*([}\]])", r"\1", value)
+
+
 def parse_json_object(text: str) -> dict:
     """从可能带代码块或解释文字的回复里抠出第一个 JSON 对象。"""
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
+    raw = _repair_json_text(text)
+    if "{" not in raw:
         raise ValueError("回复里没有 JSON 对象")
-    value = json.loads(text[start:end + 1])
+    value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("JSON 顶层不是对象")
     return value
@@ -1011,7 +1056,8 @@ def observe_group(messages: list[dict], probe: str = "", intro: str = "", chatty
         "system_instruction": {"parts": [{"text": system_text}]},
         "contents": [{"role": "user", "parts": [{"text": "请输出判断 JSON。"}]}],
         "generationConfig": {
-            "maxOutputTokens": max(80, int(CFG.get("QQ_OBSERVE_MAX_TOKENS") or 240))
+            "maxOutputTokens": max(80, int(CFG.get("QQ_OBSERVE_MAX_TOKENS") or 240)),
+            "responseMimeType": "application/json",
         },
     }
     model = str(CFG.get("QQ_OBSERVE_MODEL") or "").strip() or None
@@ -1038,6 +1084,7 @@ def observe_group(messages: list[dict], probe: str = "", intro: str = "", chatty
     try:
         result = parse_json_object(text)
     except (ValueError, TypeError) as exc:
+        print(f"[评估] JSON 解析失败：{exc} | {text[:300]!r}", flush=True)
         return (
             {"activation": 0, "addressed": False, "speak": False,
              "reply": "", "reason": f"评估格式错误：{exc}"},
