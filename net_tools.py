@@ -617,25 +617,34 @@ def _weibo_opener():
 
 
 def weibo_hot(limit: int = 20) -> list[dict]:
-    """微博热搜榜，靠访客 cookie 拿；失败返回空列表。"""
+    """微博热搜榜，靠访客 cookie 拿；cookie 失效会在同一次调用里自动重换再试一次。"""
     limit = max(1, min(50, int(limit or 20)))
-    opener = _weibo_opener()
-    if opener is None:
-        return []
-    try:
-        request = urllib.request.Request(
-            "https://weibo.com/ajax/side/hotSearch",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-                "Referer": "https://weibo.com/",
-                "Accept": "application/json",
-            },
-        )
-        with opener.open(request, timeout=12) as response:
-            data = json.loads(response.read().decode("utf-8", "replace"))
-    except Exception:  # noqa: BLE001
-        _WEIBO_STATE["opener"] = None  # cookie 可能失效，下回重新换
+    data = None
+    for _attempt in range(2):
+        opener = _weibo_opener()
+        if opener is None:
+            _WEIBO_STATE["opener"] = None
+            _WEIBO_STATE["at"] = 0.0
+            continue
+        try:
+            request = urllib.request.Request(
+                "https://weibo.com/ajax/side/hotSearch",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                    "Referer": "https://weibo.com/",
+                    "Accept": "application/json",
+                },
+            )
+            with opener.open(request, timeout=12) as response:
+                data = json.loads(response.read().decode("utf-8", "replace"))
+            break
+        except Exception:  # noqa: BLE001
+            # cookie 可能刚好失效：清掉状态，下一轮换新的再试一次
+            data = None
+            _WEIBO_STATE["opener"] = None
+            _WEIBO_STATE["at"] = 0.0
+    if data is None:
         return []
     items: list[dict] = []
     for raw in ((data.get("data") or {}).get("realtime") or [])[:limit]:
