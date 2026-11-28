@@ -1949,6 +1949,7 @@ class Handler(BaseHTTPRequestHandler):
             reply, usage, error, tool_events = call_gemini(
                 mem, message, channel, speaker, profile, persona_override, context, media, style
             )
+            query_mode = channel == "group" and search_requested(message)
             reply_to_user = reply
             reflection_usage = {}
             now = time.time()
