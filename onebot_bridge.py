@@ -1199,13 +1199,13 @@ def _split_fragments(text: str, soft: int = 26) -> list[str]:
     return parts
 
 
-def split_reply(text: str, limit: int = 0) -> list[str]:
+def split_reply(text: str, limit: int = 0, max_chars: int = 200, soft: int = 26) -> list[str]:
     """像真人一样一条条发：保留模型自己分的行，太多条才合并尾部。"""
     limit = limit or _int_cfg("QQ_SPLIT_PARTS", 3, 1, 5)
     text = (text or "").strip()
     if not text:
         return []
-    parts = _split_fragments(text)
+    parts = _split_fragments(text, soft=soft)
     if not parts:
         return []
     if len(parts) > limit:
@@ -1215,7 +1215,7 @@ def split_reply(text: str, limit: int = 0) -> list[str]:
     parts = [part for part in parts if part]
     if len(parts) > 1 and "\n" not in text and len(text) <= 20:
         parts = ["".join(parts)]
-    return [part[:200] for part in parts]
+    return [part[:max_chars] for part in parts]
 
 
 def typing_delay(text: str) -> float:
@@ -1241,7 +1241,7 @@ def ask_core(
     text: str, session: str, channel: str, speaker: str,
     profile: str = "", persona_override: str = "", context: str = "",
     media: list[dict] | None = None, style: str = "",
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, bool]:
     payload = json.dumps(
         {
             "message": text, "session": session, "channel": channel,
@@ -1262,8 +1262,8 @@ def ask_core(
         with urllib.request.urlopen(request, timeout=CORE_TIMEOUT) as response:
             data = json.load(response)
     except Exception as exc:  # noqa: BLE001
-        return "", f"{type(exc).__name__}: {exc}"
-    return str(data.get("reply") or ""), data.get("error")
+        return "", f"{type(exc).__name__}: {exc}", False
+    return str(data.get("reply") or ""), data.get("error"), bool(data.get("query_mode"))
 
 
 def onebot_call(action: str, payload: dict) -> dict | None:
@@ -1663,7 +1663,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         log_line(f"[媒体] {group_id} | 图 {sum(1 for m in media if m['type'] == 'image')} "
                  f"视频 {sum(1 for m in media if m['type'] == 'video')}")
     with _reply_lock:
-        reply, error = ask_core(
+        reply, error, query_mode = ask_core(
             prompt, session, channel, speaker,
             profile_context, persona, group_context, media,
             build_style_context(group_id) if group else "",
@@ -1677,7 +1677,7 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         log_line(f"[去重] {group_id} | 原回复太像：{reply[:60]}")
         retry_prompt = prompt + "\n（刚才你说过很相近的话，这次换个说法，别重复。）"
         with _reply_lock:
-            retry, retry_error = ask_core(
+            retry, retry_error, _ = ask_core(
                 retry_prompt, session, channel, speaker,
                 profile_context, persona, group_context, media,
                 build_style_context(group_id) if group else "",
@@ -1685,7 +1685,11 @@ def handle_event(event: dict, simulated: bool = False) -> dict:
         if retry and not retry_error:
             reply = retry
 
-    parts = split_reply(clean_for_group(reply) if group else reply)
+    if query_mode and group:
+        # 查询任务：作为信息助手给完整回答，按模型分的段走，不拆成 26 字碎片
+        parts = split_reply(clean_for_group(reply), limit=5, max_chars=1000, soft=1000)
+    else:
+        parts = split_reply(clean_for_group(reply) if group else reply)
     if group:
         ok = send_group_parts(group_id, parts, reply_id, user_id)
     else:

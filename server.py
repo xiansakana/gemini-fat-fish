@@ -928,12 +928,15 @@ def call_gemini(
 
     group = channel == "group"
     force_search = group and search_requested(message)
+    # 查询模式：明确要查资料时，当成信息助手而不是闲聊，给足 token 说完整
+    query_mode = force_search
     model = str(CFG.get("QQ_GROUP_MODEL") or "").strip() if group else ""
-    max_tokens = (
-        int(CFG.get("QQ_GROUP_MAX_TOKENS") or 260)
-        if group
-        else int(CFG["MAX_OUTPUT_TOKENS"])
-    )
+    if query_mode:
+        max_tokens = int(CFG.get("QQ_QUERY_MAX_TOKENS") or 2048)
+    elif group:
+        max_tokens = int(CFG.get("QQ_GROUP_MAX_TOKENS") or 260)
+    else:
+        max_tokens = int(CFG["MAX_OUTPUT_TOKENS"])
 
     history = mem.get("history", [])[-int(CFG["RECENT_TURNS"]) * 2:]
     contents = []
@@ -957,13 +960,17 @@ def call_gemini(
         contents.append({"role": "user", "parts": user_parts})
     else:
         parts_ = [{"text": message}]
-        if force_search:
+        if query_mode:
             parts_.append({"text": (
-                "（系统指令，最高优先级：这条消息明确要求查实时信息。"
+                "（系统指令，最高优先级：这是一条【查询任务】，不是闲聊。"
                 "今天是 " + time.strftime("%Y年%m月%d日") + "，查询词里不要写其它年份。"
-                "先调工具拿真实结果再回答：股票/指数/行情/涨跌用 finquote，"
-                "财经消息面/市场新闻用 finnews，其他实时信息用 web_search；"
-                "禁止编造行情数字，禁止用“懒得查”“自己看”推脱。）"
+                "先调工具拿真实结果：股票/指数/行情/涨跌用 finquote，"
+                "财经消息面/市场新闻用 finnews，其他实时信息用 web_search。"
+                "回答方式：当作查询工具人，把查到的关键信息完整列出来——"
+                "行情要给出具体点位、涨跌幅和时间；消息面要给出具体条目。"
+                "不要压缩成两三句闲聊，不要说“懒得查”“自己看”“不告诉你”，"
+                "不要只报一两个数字就打发人。开头或结尾可以有一句她的口吻吐槽，"
+                "但主体必须是完整、清楚的信息。）"
             )})
         contents.append({"role": "user", "parts": parts_})
 
@@ -1991,6 +1998,7 @@ class Handler(BaseHTTPRequestHandler):
                     "usage": usage,
                     "reflection_usage": reflection_usage,
                     "tool_events": tool_events,
+                    "query_mode": query_mode,
                     "usage_total": mem["usage"],
                     "facts": mem["facts"],
                     "evolve": mem.get("evolve", {}),
