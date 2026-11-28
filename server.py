@@ -353,7 +353,7 @@ def time_context() -> tuple[str, str]:
         period = "晚上"
     else:
         period = "深夜"
-    return period, f"{period} {hour:02d}:{minute:02d}"
+    return period, f"{now.tm_year}年{now.tm_mon}月{now.tm_mday}日 {period} {hour:02d}:{minute:02d}"
 
 
 def days_together(mem: dict) -> int:
