@@ -523,15 +523,23 @@ def build_system_instruction(
 
     surf_items = load_surf().get("items") or []
     if surf_items:
-        lines = [
-            f"{item.get('title', '')}（UP {item.get('up', '')}）——{item.get('note', '')}"
-            for item in surf_items[-3:]
-            if isinstance(item, dict)
-        ]
+        lines = []
+        for item in surf_items[-3:]:
+            if not isinstance(item, dict):
+                continue
+            line = f"{item.get('title', '')}（UP {item.get('up', '')}）——{item.get('note', '')}"
+            url = str(item.get("url") or "").strip()
+            if url:
+                line += "｜" + url
+            lines.append(line)
         if lines:
             blocks.append(
                 "【你最近自己刷到的 B 站视频，只是背景，别主动炫耀】\n"
                 + "\n".join("- " + line for line in lines[:3])
+                + "\n（链接的用法：只有对方明确问「什么视频」「发个链接」，"
+                "或者话题正好聊到这个视频本身时，才把对应链接原样贴出来，"
+                "贴的时候单独一行、不要加别的字；平时闲聊只提标题和你的感想，"
+                "不要主动贴链接、不要变成推荐视频的营销号。）"
             )
     if context:
         blocks.append(
