@@ -209,6 +209,9 @@ DEFAULTS = {
     "SURF_DAILY_CALLS": "8",
     "SURF_MODEL": "gemini-3.5-flash-lite",
     "SURF_NOTE_TOKENS": "120",
+    # 按群话题刷到视频后，要不要主动分享到群里
+    "SURF_FOLLOW_GROUP_TOPICS": "1",
+    "QQ_BRIDGE_PORT": "8767",
     # 群事件（撤回/入群/退群）回应概率与最短间隔
     "QQ_NOTICE_RATE": "0.5",
     "QQ_NOTICE_GAP": "60",
@@ -540,11 +543,42 @@ def surf_once(force: bool = False) -> dict:
         data["last_ts"] = entry["ts"]
         save_surf(data)
     print(f"[刷B站] {title[:40]} | {note[:60]}", flush=True)
+    if topic_info:
+        share_to_group(entry)
     return {"ok": True, **entry}
 
 
+def share_to_group(entry: dict) -> None:
+    """把「按群话题刷到」的视频告诉桥，由桥判断要不要主动发到群里。"""
+    group_id = str(entry.get("group_id") or "").strip()
+    if not group_id:
+        return
+    port = str(CFG.get("QQ_BRIDGE_PORT") or "8767")
+    payload = json.dumps(
+        {
+            "group_id": group_id,
+            "title": entry.get("title", ""),
+            "note": entry.get("note", ""),
+            "url": entry.get("url", ""),
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/surf_share",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8", "replace"))
+        print(f"[分享视频] {result}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[分享视频] 通知桥失败 {type(exc).__name__}: {exc}", flush=True)
+
+
 def surf_loop() -> None:
-    """后台慢慢刷，不打扰聊天；只写记忆，不主动发群消息。"""
+    """后台慢慢刷；刷到本群话题相关的视频时，交给桥按概率分享到群里。"""
     interval = max(10, int(CFG.get("SURF_INTERVAL_MINUTES") or 180)) * 60
     while True:
         time.sleep(interval)

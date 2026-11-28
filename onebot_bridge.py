@@ -214,6 +214,11 @@ def sticker_rate() -> float:
     return _float_cfg("QQ_STICKER_RATE", 0.08, 0.0, 1.0)
 
 
+def surf_share_rate() -> float:
+    """刷到本群话题相关的视频后，主动分享到群里的概率。"""
+    return _float_cfg("QQ_SURF_SHARE_RATE", 0.4, 0.0, 1.0)
+
+
 def notice_rate() -> float:
     return _float_cfg("QQ_NOTICE_RATE", 0.5, 0.0, 1.0)
 
@@ -1361,6 +1366,49 @@ def send_group_parts(group_id: str, parts: list[str], reply_id: str | None = Non
     return True
 
 
+def handle_surf_share(payload: dict) -> dict:
+    """核心按群话题刷到视频后，按概率主动分享一条到群里。
+
+    保护：群白名单、时段（默认 9-23 点）、发言冷却、群里最近得有人聊、概率控制。
+    """
+    group_id = str(payload.get("group_id") or "").strip()
+    url = str(payload.get("url") or "").strip()
+    note = str(payload.get("note") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    if not group_id or not url.startswith("http"):
+        return {"ok": False, "reason": "缺少群号或链接"}
+    if group_id not in group_whitelist():
+        return {"ok": False, "reason": "群不在白名单"}
+    if is_dry():
+        log_line(f"[分享视频][干跑] {group_id} | {title[:40]} | {url}")
+        return {"ok": False, "reason": "干跑模式不发送"}
+    now = time.time()
+    hour = int(time.strftime("%H", time.localtime(now)))
+    start = _int_cfg("QQ_SURF_SHARE_START", 9, 0, 23)
+    end = _int_cfg("QQ_SURF_SHARE_END", 23, 1, 24)
+    if not start <= hour < end:
+        return {"ok": False, "reason": "不在分享时段"}
+    last_reply = float(_group_last_reply.get(group_id, 0.0))
+    if now - last_reply < observe_cooldown():
+        return {"ok": False, "reason": "刚说过话，冷却中"}
+    # 群里最近半小时至少有两句，不然突然甩链接很像广告
+    recent = [
+        item for item in _group_buffer.get(group_id, [])
+        if now - float(item.get("ts") or 0) < 1800
+    ]
+    if len(recent) < 2:
+        return {"ok": False, "reason": "群里太安静"}
+    if random.random() > surf_share_rate():
+        return {"ok": False, "reason": "这次不分享"}
+    parts = [note[:200] or f"刚刷到个视频，{title[:40]}", url]
+    ok = send_group_parts(group_id, parts, None, None)
+    if ok:
+        _group_last_reply[group_id] = now
+        _group_last_bot_text[group_id] = note[:200]
+        log_line(f"[分享视频] {group_id} | {title[:40]} | {url}")
+    return {"ok": ok}
+
+
 def ask_event(event_text: str, context: str) -> str:
     payload = json.dumps(
         {"event": event_text, "context": context}, ensure_ascii=False
@@ -1940,6 +1988,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/api/reload":
             self._json(reload_runtime_config())
+            return
+        if self.path == "/api/surf_share":
+            self._json(handle_surf_share(self._body()))
             return
         if self.path == "/onebot":
             event = self._body()
