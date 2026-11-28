@@ -386,11 +386,34 @@ def _surf_enabled() -> bool:
     return str(CFG.get("SURF_ENABLED", "1")).lower() not in ("0", "false", "no", "off")
 
 
+def _extract_search_keyword(summaries: list[str]) -> str:
+    """让 lite 模型从群聊摘要里提炼一个能直接搜 B 站的短关键词。"""
+    text = "\n".join("- " + item[:160] for item in summaries[-3:])
+    prompt = (
+        "下面是群聊最近的话题摘要。请提炼一个最适合在 B 站搜索的短关键词，"
+        "用于找相关视频。要求：2 到 6 个汉字，是一个名词或短语（比如「年终奖」「摄影」"
+        "「A股」「绝区零」），不要句子、不要人名、不要标点、不要解释。只输出关键词本身。\n\n"
+        + text
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 24},
+    }
+    result, _error = gemini_post(payload, timeout=25, model=str(CFG.get("SURF_MODEL") or ""))
+    if result is None:
+        return ""
+    candidates = result.get("candidates") or []
+    parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+    keyword = "".join(part.get("text", "") for part in parts if part.get("text")).strip()
+    keyword = re.sub(r"[\s，。！？、；：“”\"'（）()【】]+", "", keyword)[:12]
+    return keyword if len(keyword) >= 2 else ""
+
+
 def recent_group_topics(limit_groups: int = 2) -> list[dict]:
     """从各群最近的摘要里取话题，供刷视频时按兴趣找。
 
     返回 [{"group_id": "...", "topic": "...", "keyword": "..."}]，按群活跃度排序。
-    关键词直接用摘要原文里的短语，过长会截断，够 B 站搜索用了。
+    关键词由 lite 模型从摘要里提炼，直接拿整句摘要去搜 B 站搜不出东西。
     """
     found: list[dict] = []
     try:
@@ -413,15 +436,13 @@ def recent_group_topics(limit_groups: int = 2) -> list[dict]:
         ]
         if not summaries:
             continue
-        topic = summaries[-1][:120]
-        # 用摘要尾部（通常是具体话题）当搜索词，去掉人名和标点噪音
-        keyword = re.sub(r"[\s，。！？、；：]+", " ", topic)
-        keyword = re.sub(r"[A-Za-z0-9@_]+", " ", keyword).strip()
-        keyword = " ".join(keyword.split()[:3])[:20]
-        if len(keyword) < 2:
+        keyword = _extract_search_keyword(summaries)
+        if not keyword:
             continue
         group_id = os.path.basename(path).replace("group_", "").replace(".json", "")
-        found.append({"group_id": group_id, "topic": topic, "keyword": keyword})
+        found.append(
+            {"group_id": group_id, "topic": summaries[-1][:120], "keyword": keyword}
+        )
     return found
 
 
