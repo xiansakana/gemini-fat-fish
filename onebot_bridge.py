@@ -1215,6 +1215,18 @@ def split_reply(text: str, limit: int = 0, max_chars: int = 200, soft: int = 26)
     parts = [part for part in parts if part]
     if len(parts) > 1 and "\n" not in text and len(text) <= 20:
         parts = ["".join(parts)]
+    # 链接单独成条，别和正文黏在一句里（点起来更清爽）
+    expanded: list[str] = []
+    for part in parts:
+        match = re.search(r"https?://\S+", part)
+        if match and match.start() > 0:
+            head = part[: match.start()].strip(" ：:，,")
+            if head:
+                expanded.append(head)
+            expanded.append(match.group(0))
+        else:
+            expanded.append(part)
+    parts = [part for part in expanded if part]
     return [part[:max_chars] for part in parts]
 
 
