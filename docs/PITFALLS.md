@@ -7,6 +7,21 @@
 
 ---
 
+## 2026-11-28 · 新增函数用了 `glob` 但没导入，运行时 NameError
+
+**现象**：按群话题刷 B 站功能上线后，调用 `recent_group_topics()` 直接报 `NameError: name 'glob' is not defined`。
+
+**根因**：`server.py` 原来没导入 `glob`，新函数里用了 `glob.glob(...)`。`py_compile` 只检查语法，不检查名字是否存在。
+
+**修复**：`import glob` 加进 `server.py` 顶部。
+
+**教训**：
+1. 新写函数用了哪些模块级函数/常量，落地前先在脑子里过一遍导入。`py_compile` 通过 ≠ 能跑。
+2. 改完必须**真调用一次新函数**（我这次是部署后才用 `python3 -c` 调 `recent_group_topics()` 才发现）。
+3. 同类问题已出现三次（force_search 作用域、query_mode 作用域、glob 未导入），统一教训：**新增代码路径必须有至少一次真实执行验证**，不能只看编译结果。
+
+---
+
 ## 2026-11-28 · 查询模式 `query_mode` 作用域错误，/api/chat 直接 NameError
 
 **现象**：加了查询模式后，核心服务每次请求都崩，桥报 `RemoteDisconnected`；err 日志 `NameError: name 'query_mode' is not defined`。
