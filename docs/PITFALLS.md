@@ -7,6 +7,21 @@
 
 ---
 
+## 2026-11-28 · 查询模式 `query_mode` 作用域错误，/api/chat 直接 NameError
+
+**现象**：加了查询模式后，核心服务每次请求都崩，桥报 `RemoteDisconnected`；err 日志 `NameError: name 'query_mode' is not defined`。
+
+**根因**：`query_mode` 定义在 `call_gemini()` 函数内部，但我把它写进了 `do_POST` 的 JSON 返回里——两个不同的作用域，`do_POST` 里根本没有这个变量。（之前踩过一次同类的坑：`force_search` 定义在 contents 组装之后，也是作用域/顺序问题。）
+
+**修复**：在 `do_POST` 里用同样的判断重算一遍：`query_mode = channel == "group" and search_requested(message)`。
+
+**教训**：
+1. 跨函数传递状态要么放进返回值，要么在使用的地方重新算，别假设函数内的局部变量在外面可见。
+2. `py_compile` 过不了这类错误——它是运行时 NameError。**改完必须真实调用一次** `/api/chat` 看返回，不能只编译。
+3. 同一类错误（变量作用域/定义顺序）已经踩了两次（force_search、query_mode），以后新增「模式标志」变量时先在脑子里过一遍：它在哪定义、在哪用、中间隔了几个函数。
+
+---
+
 ## 2026-11-28 · 重建 NapCat 容器漏掉 `host.docker.internal` 映射，群里 @ 全部没反应
 
 **现象**：三个 systemd 服务都 active，NapCat `get_status` 返回 `online: true`，容器 up，但群里 @ 她没有任何反应，群消息日志停在几小时前。
