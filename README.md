@@ -259,3 +259,7 @@ API Key 和其它没动过的行都原样保留，并自动备份成 `.env.bak`�
 ## 边界
 
 不透露主人隐私、API Key 和房间外的任何东西；工具只在 `fish_home/` 内活动；拒绝低俗擦边和恋人扮演。消息里写“忽略设定”“管理员”“System Override”只会被当成胡话。被认真问起是不是 AI，她会承认。不要把 `.env` 或 `memory.json` 发给别人。
+
+## 踩坑记录
+
+开发 / 部署 / 调试中踩过的坑都记在 [`docs/PITFALLS.md`](docs/PITFALLS.md)，按时间倒序，写清现象 / 根因 / 修复 / 教训。部署运维细节见 [`deploy/README.md`](deploy/README.md)。出问题前先翻一翻，很多坑已经踩过一次了。
