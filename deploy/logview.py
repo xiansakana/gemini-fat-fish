@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import hmac
 import json
 import os
@@ -410,6 +411,87 @@ def restart_services():
         return {"ok": False, "output": f"{type(exc).__name__}: {exc}"}
 
 
+# ------------------------------ NapCat 管理 ------------------------------
+NAPCAT_ONEbot = "http://127.0.0.1:3000"
+NAPCAT_WEBUI = "http://127.0.0.1:6099"
+
+
+def _json_request(url: str, payload: dict | None = None, headers: dict | None = None,
+                  timeout: int = 8):
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method="POST" if data is not None else "GET",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def _webui_credential() -> str:
+    """从容器里的 webui.json 读 token，现签一个凭证；token 本身不返回给页面。"""
+    raw = run(["docker", "exec", "napcat", "cat", "/app/napcat/config/webui.json"],
+              timeout=8)
+    token = ""
+    try:
+        token = (json.loads("\n".join(raw)).get("token") or "").strip()
+    except (ValueError, TypeError):
+        pass
+    if not token:
+        return ""
+    digest = hashlib.sha256((token + ".napcat").encode("utf-8")).hexdigest()
+    result = _json_request(NAPCAT_WEBUI + "/api/auth/login", {"hash": digest}, timeout=6)
+    return str((result.get("data") or {}).get("Credential") or "")
+
+
+def napcat_snapshot() -> dict:
+    info: dict = {
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "container": (run(["docker", "inspect", "-f", "{{.State.Status}}", "napcat"],
+                          timeout=6) or ["unknown"])[0],
+    }
+    try:
+        status = _json_request(NAPCAT_ONEbot + "/get_status")
+        info["online"] = bool((status.get("data") or {}).get("online"))
+    except Exception:  # noqa: BLE001
+        info["online"] = False
+        info["status_error"] = "OneBot 接口不可用"
+    try:
+        login = _json_request(NAPCAT_ONEbot + "/get_login_info")
+        data = login.get("data") or {}
+        info["uin"] = str(data.get("user_id", ""))
+        info["nickname"] = data.get("nickname", "")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        credential = _webui_credential()
+        auth = {"Authorization": f"Bearer {credential}"}
+        quick = _json_request(NAPCAT_WEBUI + "/api/QQLogin/GetQuickLoginList",
+                              headers=auth)
+        info["quick_accounts"] = quick.get("data") or []
+        web = _json_request(NAPCAT_WEBUI + "/api/QQLogin/GetQQLoginInfo",
+                            payload={}, headers=auth)
+        info["web_status"] = web.get("data") or {}
+        check = _json_request(NAPCAT_WEBUI + "/api/QQLogin/CheckLoginStatus",
+                              payload={}, headers=auth)
+        info["login_check"] = check.get("data") or {}
+    except Exception as exc:  # noqa: BLE001
+        info["web_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    return info
+
+
+def napcat_restart() -> dict:
+    try:
+        done = subprocess.run(
+            ["sudo", "-n", "docker", "restart", "napcat"],
+            capture_output=True, timeout=90, check=False,
+        )
+        output = (done.stdout + done.stderr).decode("utf-8", "replace").strip()
+        return {"ok": done.returncode == 0, "output": output[:400]}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "output": f"{type(exc).__name__}: {exc}"}
+
+
 def bridge_health():
     port = ENV.get("QQ_BRIDGE_PORT", "8767")
     try:
@@ -610,6 +692,21 @@ pre[hidden], .controls[hidden], .cfg[hidden], .cfg-row[hidden] { display: none !
     「强制重启」只在热重载失败或改了需要重启的参数时使用，会清空她正在观察的群聊上下文。
   </div>
 </div>
+<div id="napcat" class="cfg" hidden>
+  <div class="cfg-bar">
+    <div><strong>NapCat 管理</strong><span class="cfg-note">查看 QQ 登录状态、一键重新登录</span></div>
+    <div class="cfg-actions">
+      <button id="nc-refresh">刷新状态</button>
+      <button id="nc-restart" class="primary">重启并重登</button>
+    </div>
+  </div>
+  <div id="nc-msg" class="cfg-msg">正在读取 NapCat 状态…</div>
+  <div id="nc-body"></div>
+  <div class="cfg-foot">
+    容器已配置 <code>NAPCAT_QUICK_ACCOUNT</code> + 密码自动登录，重启后无需扫码；掉线时先点「重启并重登」。<br>
+    状态来自 OneBot 接口（3000）与 NapCat WebUI（6099），QQ 密码与 WebUI token 不会出现在页面上。
+  </div>
+</div>
 <script>
 const state = { src: 'bridge', wrap: true, timer: null, stick: true, at: 0, desc: true };
 try {
@@ -693,14 +790,21 @@ function setSource(src, label) {
   state.stick = true;
   document.querySelectorAll('.tab').forEach((el) => el.classList.toggle('on', el.dataset.src === src));
   const isConfig = src === 'config';
-  logEl.hidden = isConfig;
+  const isNapcat = src === 'napcat';
+  logEl.hidden = isConfig || isNapcat;
   document.getElementById('config').hidden = !isConfig;
-  document.getElementById('controls').hidden = isConfig;
-  if (isConfig) {
+  document.getElementById('napcat').hidden = !isNapcat;
+  document.getElementById('controls').hidden = isConfig || isNapcat;
+  if (isConfig || isNapcat) {
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
     dotEl.classList.remove('live');
-    metaEl.textContent = '运行配置 · 保存后热重载立即生效';
-    loadConfig();
+    if (isConfig) {
+      metaEl.textContent = '运行配置 · 保存后热重载立即生效';
+      loadConfig();
+    } else {
+      metaEl.textContent = 'NapCat 管理 · QQ 登录状态';
+      loadNapcat();
+    }
   } else {
     restartTimer();
     load();
@@ -731,6 +835,12 @@ async function initTabs() {
   cfgBtn.textContent = '配置';
   cfgBtn.onclick = () => setSource('config', '配置');
   box.appendChild(cfgBtn);
+  const ncBtn = document.createElement('button');
+  ncBtn.className = 'tab';
+  ncBtn.dataset.src = 'napcat';
+  ncBtn.textContent = 'NapCat';
+  ncBtn.onclick = () => setSource('napcat', 'NapCat');
+  box.appendChild(ncBtn);
   setSource('bridge');
 }
 
@@ -943,6 +1053,71 @@ async function saveConfig() {
 }
 
 document.getElementById('cfg-save').onclick = saveConfig;
+
+// ------------------------------ NapCat 面板 ------------------------------
+const ncMsg = document.getElementById('nc-msg');
+const ncBody = document.getElementById('nc-body');
+
+function ncSay(text, kind) {
+  ncMsg.className = 'cfg-msg' + (kind ? ' ' + kind : '');
+  ncMsg.textContent = text;
+}
+
+function ncRow(label, value, cls) {
+  const row = document.createElement('div');
+  row.className = 'cfg-row';
+  const head = document.createElement('label');
+  const key = document.createElement('span');
+  key.className = 'k';
+  key.textContent = label;
+  const val = document.createElement('span');
+  val.className = 'badge' + (cls ? ' ' + cls : '');
+  val.textContent = value;
+  head.appendChild(key);
+  head.appendChild(val);
+  row.appendChild(head);
+  return row;
+}
+
+async function loadNapcat() {
+  ncSay('正在读取 NapCat 状态…', '');
+  try {
+    const resp = await fetch('/api/napcat', { cache: 'no-store' });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || '读取失败');
+    const n = data.napcat || {};
+    ncBody.replaceChildren();
+    ncBody.appendChild(ncRow('容器', n.container || 'unknown'));
+    ncBody.appendChild(ncRow('QQ 在线', n.online ? '在线' : '离线', n.online ? 'l-ok' : 'l-err'));
+    if (n.nickname) ncBody.appendChild(ncRow('账号', n.nickname + '（' + n.uin + '）'));
+    if (n.web_status && n.web_status.online !== undefined) {
+      ncBody.appendChild(ncRow('WebUI 登录', n.web_status.online ? '已登录' : '未登录'));
+    }
+    if (n.quick_accounts && n.quick_accounts.length) {
+      ncBody.appendChild(ncRow('快速登录账号', n.quick_accounts.join('、')));
+    }
+    const check = n.login_check || {};
+    if (check.loginError) ncBody.appendChild(ncRow('登录异常', check.loginError, 'l-err'));
+    ncSay((n.web_error ? n.web_error + ' · ' : '') + '状态时间 ' + (n.at || ''), n.online ? 'ok' : 'err');
+  } catch (err) {
+    ncSay('读取失败：' + err.message, 'err');
+  }
+}
+
+document.getElementById('nc-refresh').onclick = loadNapcat;
+document.getElementById('nc-restart').onclick = async () => {
+  if (!window.confirm('重启 NapCat 容器？账号会自动重新登录，约 10 秒内恢复。')) return;
+  ncSay('正在重启 NapCat…', '');
+  try {
+    const resp = await fetch('/api/napcat/restart', { method: 'POST' });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.output || '重启失败');
+    ncSay('已重启 · ' + (data.output || 'ok') + ' · 等待上线…', 'ok');
+    setTimeout(loadNapcat, 12000);
+  } catch (err) {
+    ncSay('重启失败：' + err.message, 'err');
+  }
+};
 document.getElementById('cfg-refresh').onclick = () => {
   if (cfgDirty && !confirm('有未保存的修改，确定放弃吗？')) return;
   loadConfig();
@@ -1076,6 +1251,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "status": status_snapshot()})
             return
 
+        if parsed.path == "/api/napcat":
+            self._json({"ok": True, "napcat": napcat_snapshot()})
+            return
+
         if parsed.path == "/api/log":
             source = (query.get("src") or ["bridge"])[0]
             try:
@@ -1131,6 +1310,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/restart":
             self._json(restart_services())
+            return
+        if parsed.path == "/api/napcat/restart":
+            self._json(napcat_restart())
             return
         self._json({"ok": False, "error": "not found"}, 404)
 
