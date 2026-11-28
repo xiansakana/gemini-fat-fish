@@ -960,6 +960,7 @@ def call_gemini(
         if force_search:
             parts_.append({"text": (
                 "（系统指令，最高优先级：这条消息明确要求查实时信息。"
+                "今天是 " + time.strftime("%Y年%m月%d日") + "，查询词里不要写其它年份。"
                 "先调工具拿真实结果再回答：股票/指数/行情/涨跌用 finquote，"
                 "财经消息面/市场新闻用 finnews，其他实时信息用 web_search；"
                 "禁止编造行情数字，禁止用“懒得查”“自己看”推脱。）"
