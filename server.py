@@ -385,8 +385,47 @@ def _surf_enabled() -> bool:
     return str(CFG.get("SURF_ENABLED", "1")).lower() not in ("0", "false", "no", "off")
 
 
+def recent_group_topics(limit_groups: int = 2) -> list[dict]:
+    """从各群最近的摘要里取话题，供刷视频时按兴趣找。
+
+    返回 [{"group_id": "...", "topic": "...", "keyword": "..."}]，按群活跃度排序。
+    关键词直接用摘要原文里的短语，过长会截断，够 B 站搜索用了。
+    """
+    found: list[dict] = []
+    try:
+        paths = sorted(
+            glob.glob(str(SESSIONS_DIR / "group_*.json")),
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+    except OSError:
+        return []
+    for path in paths[: max(1, limit_groups)]:
+        try:
+            data = json.loads(open(path, encoding="utf-8").read())
+        except (OSError, ValueError):
+            continue
+        summaries = [
+            str(item.get("text", "")).strip()
+            for item in (data.get("summaries") or [])
+            if isinstance(item, dict) and item.get("text")
+        ]
+        if not summaries:
+            continue
+        topic = summaries[-1][:120]
+        # 用摘要尾部（通常是具体话题）当搜索词，去掉人名和标点噪音
+        keyword = re.sub(r"[\s，。！？、；：]+", " ", topic)
+        keyword = re.sub(r"[A-Za-z0-9@_]+", " ", keyword).strip()
+        keyword = " ".join(keyword.split()[:3])[:20]
+        if len(keyword) < 2:
+            continue
+        group_id = os.path.basename(path).replace("group_", "").replace(".json", "")
+        found.append({"group_id": group_id, "topic": topic, "keyword": keyword})
+    return found
+
+
 def surf_once(force: bool = False) -> dict:
-    """自己刷一条 B 站：挑个热门视频，用 lite 模型写一句她的想法，存进记忆。"""
+    """自己刷一条 B 站：优先按群聊话题搜，搜不到回退热门榜。"""
     if not force and not _surf_enabled():
         return {"ok": False, "reason": "刷视频已关闭"}
     if not CFG["GEMINI_API_KEY"]:
@@ -401,19 +440,45 @@ def surf_once(force: bool = False) -> dict:
         if not force and int(data.get("count", 0) or 0) >= int(CFG.get("SURF_DAILY_CALLS") or 8):
             return {"ok": False, "reason": "今天的额度用完了"}
 
-    items = net_tools.popular_items(12)
-    if not items:
-        return {"ok": False, "reason": "拿不到热门榜"}
-    picked = random.choice(items[:10])
-    bvid = str(picked.get("bvid") or "")
-    info = net_tools.video_info(bvid) or picked
-    title = str(info.get("title") or picked.get("title") or "")
-    owner = str((info.get("owner") or {}).get("name") or (picked.get("owner") or {}).get("name") or "")
-    desc = re.sub(r"\s+", " ", str(info.get("desc") or ""))[:300]
-    duration = int(info.get("duration") or 0)
+    topic_info = {}
+    picked = {}
+    if str(CFG.get("SURF_FOLLOW_GROUP_TOPICS", "1")).lower() not in ("0", "false", "no", "off"):
+        for topic in recent_group_topics():
+            results = net_tools.search_videos(topic["keyword"], 10)
+            if results:
+                picked = random.choice(results[:8])
+                topic_info = topic
+                break
+    if not picked:
+        items = net_tools.popular_items(12)
+        if not items:
+            return {"ok": False, "reason": "拿不到热门榜"}
+        picked = random.choice(items[:10])
 
+    bvid = str(picked.get("bvid") or "")
+    info = net_tools.video_info(bvid) or {}
+    title = str(info.get("title") or picked.get("title") or "")
+    owner = str((info.get("owner") or {}).get("name") or picked.get("up") or "")
+    desc = re.sub(r"\s+", " ", str(info.get("desc") or picked.get("desc") or ""))[:300]
+    duration = int(info.get("duration") or 0)
+    if not duration:
+        raw_duration = str(picked.get("duration") or "")
+        if ":" in raw_duration:
+            try:
+                bits = [int(x) for x in raw_duration.split(":")]
+                duration = sum(value * 60 ** index for index, value in enumerate(reversed(bits)))
+            except ValueError:
+                duration = 0
+
+    context_note = ""
+    if topic_info:
+        context_note = (
+            f"你是顺着群里刚聊的话题去搜的：{topic_info['topic']}\n"
+            "写感想时可以自然带一句「群里刚说这个」「正好在聊」之类，但别硬提。\n"
+        )
     prompt = (
         "你刚在 B 站刷到一个视频。\n"
+        f"{context_note}"
         f"标题：{title}\nUP 主：{owner}\n时长：{duration // 60} 分 {duration % 60} 秒\n简介：{desc or '（没有简介）'}\n\n"
         "用一到两句你自己的话写你刷到它的反应或想法，口语、短、带点你的懒散吐槽，"
         "不要复述标题，不要写“作为 AI”，不要加括号动作。"
@@ -440,6 +505,9 @@ def surf_once(force: bool = False) -> dict:
         "note": note,
         "url": f"https://www.bilibili.com/video/{bvid}",
     }
+    if topic_info:
+        entry["topic"] = topic_info["topic"][:80]
+        entry["group_id"] = topic_info["group_id"]
     with _surf_lock:
         data = load_surf()
         items_list = [item for item in (data.get("items") or []) if isinstance(item, dict)]
@@ -480,7 +548,7 @@ def search_requested(message: str) -> bool:
 def build_system_instruction(
     mem: dict, channel: str = "web", speaker: str = "",
     profile: str = "", persona_override: str = "", context: str = "",
-    style: str = "",
+    style: str = "", group_id: str = "",
 ) -> str:
     persona = str(persona_override or "").strip()
     if not persona:
@@ -521,13 +589,21 @@ def build_system_instruction(
     if summaries:
         blocks.append("【最近聊过的事，只是背景】\n" + "\n".join("- " + item for item in summaries))
 
-    surf_items = load_surf().get("items") or []
+    surf_items = [item for item in (load_surf().get("items") or []) if isinstance(item, dict)]
     if surf_items:
+        # 优先挑「因为本群话题而刷到的」，其次才是通用的
+        if group_id:
+            matched = [item for item in surf_items if str(item.get("group_id") or "") == group_id]
+            others = [item for item in surf_items if str(item.get("group_id") or "") != group_id]
+            chosen = (matched[-2:] + others[-1:])[:3]
+        else:
+            chosen = surf_items[-3:]
         lines = []
-        for item in surf_items[-3:]:
-            if not isinstance(item, dict):
-                continue
+        for item in chosen:
             line = f"{item.get('title', '')}（UP {item.get('up', '')}）——{item.get('note', '')}"
+            topic = str(item.get("topic") or "").strip()
+            if topic:
+                line = f"[群里聊过：{topic[:40]}] " + line
             url = str(item.get("url") or "").strip()
             if url:
                 line += "｜" + url
@@ -928,7 +1004,7 @@ def prepare_media(media: list[dict], max_images: int = 3, video_mb: int = 20, vi
 def call_gemini(
     mem: dict, message: str, channel: str = "web", speaker: str = "",
     profile: str = "", persona_override: str = "", context: str = "",
-    media: list[dict] | None = None, style: str = "",
+    media: list[dict] | None = None, style: str = "", group_id: str = "",
 ) -> tuple[str, dict, str | None, list[dict]]:
     api_key = CFG["GEMINI_API_KEY"]
     if not api_key:
@@ -997,7 +1073,7 @@ def call_gemini(
             "system_instruction": {
                 "parts": [{
                     "text": build_system_instruction(
-                        mem, channel, speaker, profile, persona_override, context, style
+                        mem, channel, speaker, profile, persona_override, context, style, group_id
                     )
 
                 }]
@@ -1886,6 +1962,9 @@ class Handler(BaseHTTPRequestHandler):
             persona_override = str(body.get("persona_override") or "").strip()[:4000]
             context = str(body.get("context") or "").strip()[:1600]
             style = str(body.get("style") or "").strip()[:800]
+            group_id = str(body.get("group_id") or "").strip()[:32]
+            if not group_id and session.startswith("group_"):
+                group_id = session[len("group_"):]
             incoming_media = body.get("media") or []
             media = [
                 {
@@ -1957,7 +2036,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             reply, usage, error, tool_events = call_gemini(
-                mem, message, channel, speaker, profile, persona_override, context, media, style
+                mem, message, channel, speaker, profile, persona_override, context, media, style,
+                group_id,
             )
             query_mode = channel == "group" and search_requested(message)
             reply_to_user = reply

@@ -479,6 +479,63 @@ def video_info(bvid: str) -> dict:
     return data.get("data") or {}
 
 
+def search_videos(keyword: str, limit: int = 8) -> list[dict]:
+    """按关键词搜 B 站视频，返回 bvid / 标题 / UP / 播放量 / 时长。
+
+    wbi 接口不带签名也能用，但要带 buvid3 cookie，否则返回空列表。
+    """
+    keyword = str(keyword or "").strip()[:40]
+    if not keyword:
+        return []
+    url = "https://api.bilibili.com/x/web-interface/wbi/search/type?" + urllib.parse.urlencode(
+        {"search_type": "video", "keyword": keyword, "page": 1}
+    )
+    # 别带随机 buvid3：格式不合规会被风控判定异常、返回空列表；不带反而稳定
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": UA, "Referer": "https://www.bilibili.com"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return []
+    result = (data.get("data") or {}).get("result") or []
+    items: list[dict] = []
+    junk_words = ("听书", "漫剧", "完结文", "小说", "合集", "搬运")
+    for raw in result:
+        title = strip_html(str(raw.get("title") or ""))
+        if not title or not raw.get("bvid"):
+            continue
+        play = int(raw.get("play") or 0)
+        # 播放量太低的多半是短剧 / 搬运号，不是“刷到的正常视频”
+        if play < 1000:
+            continue
+        if any(word in title for word in junk_words):
+            continue
+        duration_text = str(raw.get("duration") or "")
+        if ":" in duration_text:
+            try:
+                bits = [int(x) for x in duration_text.split(":")]
+                seconds = sum(value * 60 ** index for index, value in enumerate(reversed(bits)))
+                if seconds < 60:
+                    continue
+            except ValueError:
+                pass
+        items.append(
+            {
+                "bvid": raw.get("bvid"),
+                "title": title[:120],
+                "up": str(raw.get("author") or "")[:40],
+                "play": play,
+                "duration": str(raw.get("duration") or ""),
+                "desc": strip_html(str(raw.get("description") or ""))[:160],
+            }
+        )
+    items.sort(key=lambda item: item["play"], reverse=True)
+    return items[: max(1, min(20, int(limit or 8)))]
+
+
 def bilibili_popular(limit: int = 5) -> str:
     """看 B 站当前热门，拿去当“刚刷到”的素材。"""
     limit = max(1, min(10, int(limit or 5)))
