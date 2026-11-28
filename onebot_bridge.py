@@ -64,6 +64,8 @@ _group_warmup: dict[str, float] = {}
 _backfilled: dict[str, float] = {}
 _bot_message_ids: list[str] = []
 OBSERVE_BUDGET_FILE = DATA_DIR / "qq_observe_budget.json"
+# 主动分享的时间戳落盘，桥重启后仍然记得「刚才发过」，不会连着刷两条
+SHARE_STATE_FILE = DATA_DIR / "qq_share_state.json"
 
 
 def cfg(key: str, default: str = "") -> str:
@@ -1415,6 +1417,7 @@ def handle_surf_share(payload: dict) -> dict:
     ok = send_group_parts(group_id, parts, None, None)
     if ok:
         _last_share_ts[group_id] = now
+        save_json(SHARE_STATE_FILE, _last_share_ts)
         _group_last_reply[group_id] = now
         _group_last_bot_text[group_id] = note[:200]
         log_line(f"[分享{source}] {group_id} | {title[:40]} | {url}")
@@ -2129,6 +2132,12 @@ def main() -> None:
     for gid, ts in stored.items():
         try:
             _backfilled[str(gid)] = float(ts)
+        except (TypeError, ValueError):
+            continue
+    shares = load_json(SHARE_STATE_FILE, {}) or {}
+    for gid, ts in shares.items():
+        try:
+            _last_share_ts[str(gid)] = float(ts)
         except (TypeError, ValueError):
             continue
     print(f"QQ 桥已启动：http://{host}:{port}", flush=True)
