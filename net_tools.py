@@ -105,7 +105,7 @@ def strip_html(raw: str) -> str:
 
 
 def search_web(query: str, limit: int = 5) -> str:
-    """先查 DuckDuckGo，拿不到再用真浏览器搜 Bing。"""
+    """先查 DuckDuckGo（中文结果质量明显更好），拿不到再用 Bing RSS 兜底。"""
     query = str(query or "").strip()[:200]
     if not query:
         return "要搜什么？给个关键词。"
@@ -113,9 +113,9 @@ def search_web(query: str, limit: int = 5) -> str:
     cached = SEARCH_CACHE.get(query)
     if cached and time.time() - cached[0] < 600:
         return cached[1]
-    items = _search_rss(query, limit)
+    items = _search_ddg(query, limit)
     if not items:
-        items = _search_ddg(query, limit)
+        items = _search_rss(query, limit)
     if not items:
         return f"没搜到「{query}」的结果，可能被限流了，等会儿再试。"
     result = f"搜索「{query}」的结果：\n" + "\n".join(items)
@@ -150,18 +150,26 @@ def _search_rss(query: str, limit: int) -> list[str]:
 
 
 def _search_ddg(query: str, limit: int) -> list[str]:
-    """Bing 解析不到时的备用源。"""
-    url = "https://lite.duckduckgo.com/lite/?" + urllib.parse.urlencode({"q": query})
+    """DuckDuckGo HTML 版：中文结果质量比 Bing RSS 好，带标题 + 链接 + 摘要。"""
+    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
     try:
         page = _decode(_http_get(url))
     except Exception:  # noqa: BLE001
         return []
-    titles = re.findall(r"class=.result-link.[^>]*>(.*?)</a>", page, flags=re.S)
-    links = re.findall(r"class=.result-link.[^>]*href=\"([^\"]+)\"", page, flags=re.S)
+    titles = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, flags=re.S)
+    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, flags=re.S)
     items: list[str] = []
-    for index, title in enumerate(titles[:limit]):
-        href = html_lib.unescape(links[index]) if index < len(links) else ""
-        items.append(f"{index + 1}. {strip_html(title)[:120]}\n   {href}")
+    for index, (href, title) in enumerate(titles[:limit]):
+        target = html_lib.unescape(href)
+        redirect = re.search(r"[?&]uddg=([^&]+)", target)
+        if redirect:
+            target = urllib.parse.unquote(redirect.group(1))
+        line = f"{index + 1}. {strip_html(title)[:120]}\n   {target}"
+        if index < len(snippets):
+            desc = strip_html(snippets[index])[:200].strip()
+            if desc:
+                line += "\n   " + desc
+        items.append(line)
     return items
 
 
