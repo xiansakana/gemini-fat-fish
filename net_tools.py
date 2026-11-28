@@ -536,6 +536,39 @@ def search_videos(keyword: str, limit: int = 8) -> list[dict]:
     return items[: max(1, min(20, int(limit or 8)))]
 
 
+def zhihu_hot(limit: int = 10) -> list[dict]:
+    """知乎热榜。api.zhihu.com 这个老接口不需要登录，返回标题 / 热度 / 摘要。"""
+    limit = max(1, min(30, int(limit or 10)))
+    url = "https://api.zhihu.com/topstory/hot-list?" + urllib.parse.urlencode({"limit": limit})
+    try:
+        data = _json_get(url, timeout=12)
+    except Exception:  # noqa: BLE001
+        return []
+    items: list[dict] = []
+    for raw in (data.get("data") or [])[:limit]:
+        target = raw.get("target") or {}
+        title = str(target.get("title") or "").strip()
+        question_id = str(target.get("id") or "").strip()
+        if not title or not question_id:
+            continue
+        kind = str(target.get("type") or "question")
+        link = (
+            f"https://www.zhihu.com/question/{question_id}"
+            if kind == "question"
+            else f"https://www.zhihu.com/question/{question_id}"
+        )
+        items.append(
+            {
+                "id": question_id,
+                "title": title[:120],
+                "heat": str(raw.get("detail_text") or "")[:20],
+                "excerpt": re.sub(r"\s+", " ", str(target.get("excerpt") or ""))[:200],
+                "url": link,
+            }
+        )
+    return items
+
+
 def bilibili_popular(limit: int = 5) -> str:
     """看 B 站当前热门，拿去当“刚刷到”的素材。"""
     limit = max(1, min(10, int(limit or 5)))

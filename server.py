@@ -32,6 +32,7 @@ MEMORY_FILE = ROOT / "memory.json"
 SESSIONS_DIR = ROOT / "sessions"
 PERSONA_FILE = ROOT / "persona.txt"
 SURF_FILE = ROOT / "surf.json"
+ZHIHU_FILE = ROOT / "zhihu.json"
 _surf_lock = threading.Lock()
 TOOL_ROOT = ROOT / "fish_home"
 TOOL_ROOT.mkdir(exist_ok=True)
@@ -212,6 +213,12 @@ DEFAULTS = {
     # 按群话题刷到视频后，要不要主动分享到群里
     "SURF_FOLLOW_GROUP_TOPICS": "1",
     "QQ_BRIDGE_PORT": "8767",
+    # 自己刷知乎热榜：定时挑一条，写进记忆
+    "ZHIHU_ENABLED": "1",
+    "ZHIHU_INTERVAL_MINUTES": "240",
+    "ZHIHU_DAILY_CALLS": "4",
+    "ZHIHU_MODEL": "gemini-3.5-flash-lite",
+    "ZHIHU_NOTE_TOKENS": "120",
     # 群事件（撤回/入群/退群）回应概率与最短间隔
     "QQ_NOTICE_RATE": "0.5",
     "QQ_NOTICE_GAP": "60",
@@ -588,6 +595,104 @@ def surf_loop() -> None:
             print(f"[刷B站] 异常 {type(exc).__name__} {exc}", flush=True)
 
 
+def load_zhihu() -> dict:
+    try:
+        data = json.loads(ZHIHU_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"items": []}
+    if not isinstance(data, dict):
+        return {"items": []}
+    data.setdefault("items", [])
+    return data
+
+
+def save_zhihu(data: dict) -> None:
+    try:
+        ZHIHU_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _zhihu_enabled() -> bool:
+    return str(CFG.get("ZHIHU_ENABLED", "1")).lower() not in ("0", "false", "no", "off")
+
+
+def zhihu_once(force: bool = False) -> dict:
+    """刷一条知乎热榜，用 lite 模型写一句感想，存进记忆。"""
+    if not force and not _zhihu_enabled():
+        return {"ok": False, "reason": "刷知乎已关闭"}
+    if not CFG["GEMINI_API_KEY"]:
+        return {"ok": False, "reason": "缺少 API Key"}
+
+    with _surf_lock:
+        data = load_zhihu()
+        today = time.strftime("%Y-%m-%d", local_now())
+        if data.get("day") != today:
+            data["day"] = today
+            data["count"] = 0
+        if not force and int(data.get("count", 0) or 0) >= int(CFG.get("ZHIHU_DAILY_CALLS") or 4):
+            return {"ok": False, "reason": "今天的知乎额度用完了"}
+        seen = {str(item.get("id") or "") for item in (data.get("items") or []) if isinstance(item, dict)}
+
+    items = net_tools.zhihu_hot(20)
+    if not items:
+        return {"ok": False, "reason": "拿不到知乎热榜"}
+    fresh = [item for item in items if str(item.get("id") or "") not in seen] or items
+    picked = random.choice(fresh[:10])
+
+    prompt = (
+        "你刚在知乎刷到一个热榜问题。\n"
+        f"标题：{picked['title']}\n热度：{picked.get('heat') or '未知'}\n"
+        f"简介：{picked.get('excerpt') or '（没有简介）'}\n\n"
+        "用一到两句你自己的话写你刷到它的反应或想法，口语、短、带点你的懒散吐槽或好奇，"
+        "不要复述标题，不要写“作为 AI”，不要加括号动作，不要分点。"
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": "你是 Gemini 娘，四角星猫耳少女，说话短、懒散、爱吐槽。"}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": int(CFG.get("ZHIHU_NOTE_TOKENS") or 120)},
+    }
+    result, error = gemini_post(payload, timeout=40, model=str(CFG.get("ZHIHU_MODEL") or "gemini-3.5-flash-lite"))
+    if result is None:
+        return {"ok": False, "reason": f"模型失败：{error}"}
+    candidates = result.get("candidates") or []
+    parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+    note = "".join(part.get("text", "") for part in parts if part.get("text")).strip()[:160]
+    if not note:
+        return {"ok": False, "reason": "模型没写出感想"}
+
+    entry = {
+        "ts": int(time.time()),
+        "id": picked["id"],
+        "title": picked["title"],
+        "heat": picked.get("heat", ""),
+        "note": note,
+        "url": picked["url"],
+    }
+    with _surf_lock:
+        data = load_zhihu()
+        items_list = [item for item in (data.get("items") or []) if isinstance(item, dict)]
+        items_list.append(entry)
+        data["items"] = items_list[-30:]
+        data["day"] = time.strftime("%Y-%m-%d", local_now())
+        data["count"] = int(data.get("count", 0) or 0) + 1
+        data["last_ts"] = entry["ts"]
+        save_zhihu(data)
+    print(f"[刷知乎] {picked['title'][:40]} | {note[:60]}", flush=True)
+    return {"ok": True, **entry}
+
+
+def zhihu_loop() -> None:
+    """后台慢慢刷知乎热榜，只写记忆，不主动发群消息。"""
+    interval = max(30, int(CFG.get("ZHIHU_INTERVAL_MINUTES") or 240)) * 60
+    while True:
+        time.sleep(interval)
+        try:
+            zhihu_once()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[刷知乎] 异常 {type(exc).__name__} {exc}", flush=True)
+
+
 SEARCH_INTENT_RE = re.compile(
     r"(帮我|给我|麻烦|帮忙)?(查一?下|查查|搜一?下|搜搜)"
     r"|(?:行情|大盘|收盘|开盘|消息面|新闻|热搜|汇率|股价|实时价格|评分|票房|天气|比分|赛果)"
@@ -672,6 +777,24 @@ def build_system_instruction(
                 "或者话题正好聊到这个视频本身时，才把对应链接原样贴出来，"
                 "贴的时候单独一行、不要加别的字；平时闲聊只提标题和你的感想，"
                 "不要主动贴链接、不要变成推荐视频的营销号。）"
+            )
+
+    zhihu_items = [
+        item for item in (load_zhihu().get("items") or []) if isinstance(item, dict)
+    ]
+    if zhihu_items:
+        zhihu_lines = []
+        for item in zhihu_items[-3:]:
+            line = f"{item.get('title', '')}（{item.get('heat', '')}）——{item.get('note', '')}"
+            url = str(item.get("url") or "").strip()
+            if url:
+                line += "｜" + url
+            zhihu_lines.append(line)
+        if zhihu_lines:
+            blocks.append(
+                "【你最近在知乎刷到的热榜，只是背景，别主动炫耀】\n"
+                + "\n".join("- " + line for line in zhihu_lines[:3])
+                + "\n（链接的用法同上：只有对方明确问起或话题正好撞上时才贴。）"
             )
     if context:
         blocks.append(
@@ -2169,6 +2292,8 @@ def main() -> None:
     threading.Thread(target=proactive_loop, daemon=True).start()
     if _surf_enabled():
         threading.Thread(target=surf_loop, daemon=True).start()
+    if _zhihu_enabled():
+        threading.Thread(target=zhihu_loop, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
