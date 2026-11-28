@@ -608,7 +608,7 @@ pre.nowrap { white-space: pre; word-break: normal; overflow-x: auto; }
 .l-ok { color: var(--ok); }
 .l-accent { color: #9f92ff; }
 .l-dim { color: var(--dim); }
-.cfg { max-width: 1000px; padding: 14px 16px 60px; }
+.cfg { padding: 14px 16px 60px; }
 .cfg-bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .cfg-bar strong { font-size: 15px; }
 .cfg-note { color: var(--dim); font-size: 12px; margin-left: 10px; }
@@ -790,7 +790,7 @@ function setSource(src, label) {
   state.stick = true;
   document.querySelectorAll('.tab').forEach((el) => el.classList.toggle('on', el.dataset.src === src));
   const isConfig = src === 'config';
-  const isNapcat = src === 'napcat';
+  const isNapcat = src === 'napcat-admin';
   logEl.hidden = isConfig || isNapcat;
   document.getElementById('config').hidden = !isConfig;
   document.getElementById('napcat').hidden = !isNapcat;
@@ -837,16 +837,16 @@ async function initTabs() {
   box.appendChild(cfgBtn);
   const ncBtn = document.createElement('button');
   ncBtn.className = 'tab';
-  ncBtn.dataset.src = 'napcat';
-  ncBtn.textContent = 'NapCat';
-  ncBtn.onclick = () => setSource('napcat', 'NapCat');
+  ncBtn.dataset.src = 'napcat-admin';
+  ncBtn.textContent = 'NapCat 管理';
+  ncBtn.onclick = () => setSource('napcat-admin', 'NapCat 管理');
   box.appendChild(ncBtn);
   setSource('bridge');
 }
 
 function restartTimer() {
   if (state.timer) clearInterval(state.timer);
-  if (state.src === 'config') { state.timer = null; return; }
+  if (state.src === 'config' || state.src === 'napcat-admin') { state.timer = null; return; }
   const ms = Number(document.getElementById('every').value);
   state.timer = ms ? setInterval(load, ms) : null;
 }
