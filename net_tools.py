@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gzip
 import html as html_lib
+import http.cookiejar
 import ipaddress
 import json
 import re
@@ -564,6 +565,94 @@ def zhihu_hot(limit: int = 10) -> list[dict]:
                 "heat": str(raw.get("detail_text") or "")[:20],
                 "excerpt": re.sub(r"\s+", " ", str(target.get("excerpt") or ""))[:200],
                 "url": link,
+            }
+        )
+    return items
+
+
+_WEIBO_STATE: dict = {"at": 0.0, "opener": None}
+
+
+def _weibo_opener():
+    """微博访客 cookie：genvisitor 拿 tid，再换 SUB/SUBP，缓存 30 分钟。
+
+    微博热搜直接请求一律 403 或跳访客验证，必须先走这一套换到 cookie。
+    """
+    cached = _WEIBO_STATE.get("opener")
+    if cached and time.time() - float(_WEIBO_STATE.get("at") or 0) < 1800:
+        return cached
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    mobile_ua = (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 Mobile/15E148"
+    )
+    try:
+        request = urllib.request.Request(
+            "https://passport.weibo.com/visitor/genvisitor2"
+            "?cb=visitor_gray_callback&tid=&from=weibo",
+            headers={"User-Agent": mobile_ua, "Referer": "https://weibo.com/"},
+        )
+        with opener.open(request, timeout=12) as response:
+            text = response.read().decode("utf-8", "replace")
+        match = re.search(r'"tid":"([^"]+)"', text)
+        tid = match.group(1) if match else ""
+        if not tid:
+            return None
+        url = (
+            "https://passport.weibo.com/visitor/visitor?a=incarnate&t="
+            + urllib.parse.quote(tid)
+            + "&w=2&c=095&gc=&cb=cross_domain&from=weibo&_rand=0.1"
+        )
+        with opener.open(
+            urllib.request.Request(url, headers={"User-Agent": mobile_ua, "Referer": "https://weibo.com/"}),
+            timeout=12,
+        ) as response:
+            response.read()
+    except Exception:  # noqa: BLE001
+        return None
+    _WEIBO_STATE["at"] = time.time()
+    _WEIBO_STATE["opener"] = opener
+    return opener
+
+
+def weibo_hot(limit: int = 20) -> list[dict]:
+    """微博热搜榜，靠访客 cookie 拿；失败返回空列表。"""
+    limit = max(1, min(50, int(limit or 20)))
+    opener = _weibo_opener()
+    if opener is None:
+        return []
+    try:
+        request = urllib.request.Request(
+            "https://weibo.com/ajax/side/hotSearch",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                "Referer": "https://weibo.com/",
+                "Accept": "application/json",
+            },
+        )
+        with opener.open(request, timeout=12) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        _WEIBO_STATE["opener"] = None  # cookie 可能失效，下回重新换
+        return []
+    items: list[dict] = []
+    for raw in ((data.get("data") or {}).get("realtime") or [])[:limit]:
+        word = str(raw.get("word") or "").strip()
+        if not word:
+            continue
+        try:
+            heat = int(raw.get("num") or 0)
+        except (TypeError, ValueError):
+            heat = 0
+        label = str(raw.get("label_name") or raw.get("icon_desc") or "")[:10]
+        items.append(
+            {
+                "word": word[:60],
+                "heat": heat,
+                "label": label,
+                "url": "https://s.weibo.com/weibo?q=" + urllib.parse.quote("#" + word + "#"),
             }
         )
     return items

@@ -11,3 +11,4 @@ __pycache__/
 # 她自己刷到的 B 站记录 / 知乎热榜
 surf.json
 zhihu.json
+weibo.json

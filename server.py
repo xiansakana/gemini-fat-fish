@@ -33,6 +33,7 @@ SESSIONS_DIR = ROOT / "sessions"
 PERSONA_FILE = ROOT / "persona.txt"
 SURF_FILE = ROOT / "surf.json"
 ZHIHU_FILE = ROOT / "zhihu.json"
+WEIBO_FILE = ROOT / "weibo.json"
 _surf_lock = threading.Lock()
 TOOL_ROOT = ROOT / "fish_home"
 TOOL_ROOT.mkdir(exist_ok=True)
@@ -221,6 +222,13 @@ DEFAULTS = {
     "ZHIHU_NOTE_TOKENS": "120",
     # 知乎热度达到多少「万」才值得主动分享
     "ZHIHU_SHARE_MIN_HEAT": "1000",
+    # 自己刷微博热搜
+    "WEIBO_ENABLED": "1",
+    "WEIBO_INTERVAL_MINUTES": "240",
+    "WEIBO_DAILY_CALLS": "4",
+    "WEIBO_MODEL": "gemini-3.5-flash-lite",
+    "WEIBO_NOTE_TOKENS": "120",
+    "WEIBO_SHARE_MIN_HEAT": "1000000",
     # 群事件（撤回/入群/退群）回应概率与最短间隔
     "QQ_NOTICE_RATE": "0.5",
     "QQ_NOTICE_GAP": "60",
@@ -736,6 +744,110 @@ def zhihu_loop() -> None:
             print(f"[刷知乎] 异常 {type(exc).__name__} {exc}", flush=True)
 
 
+def load_weibo() -> dict:
+    try:
+        data = json.loads(WEIBO_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"items": []}
+    if not isinstance(data, dict):
+        return {"items": []}
+    data.setdefault("items", [])
+    return data
+
+
+def save_weibo(data: dict) -> None:
+    try:
+        WEIBO_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _weibo_enabled() -> bool:
+    return str(CFG.get("WEIBO_ENABLED", "1")).lower() not in ("0", "false", "no", "off")
+
+
+def weibo_once(force: bool = False) -> dict:
+    """刷一条微博热搜，用 lite 模型写一句感想，存进记忆。"""
+    if not force and not _weibo_enabled():
+        return {"ok": False, "reason": "刷微博已关闭"}
+    if not CFG["GEMINI_API_KEY"]:
+        return {"ok": False, "reason": "缺少 API Key"}
+
+    with _surf_lock:
+        data = load_weibo()
+        today = time.strftime("%Y-%m-%d", local_now())
+        if data.get("day") != today:
+            data["day"] = today
+            data["count"] = 0
+        if not force and int(data.get("count", 0) or 0) >= int(CFG.get("WEIBO_DAILY_CALLS") or 4):
+            return {"ok": False, "reason": "今天的微博额度用完了"}
+        seen = {str(item.get("word") or "") for item in (data.get("items") or []) if isinstance(item, dict)}
+
+    items = net_tools.weibo_hot(30)
+    if not items:
+        return {"ok": False, "reason": "拿不到微博热搜"}
+    fresh = [item for item in items if str(item.get("word") or "") not in seen] or items
+    picked = random.choice(fresh[:12])
+
+    prompt = (
+        "你刚在微博刷到一条热搜。\n"
+        f"热搜词：{picked['word']}\n热度：{picked.get('heat') or 0}\n"
+        f"标签：{picked.get('label') or '无'}\n\n"
+        "用一到两句你自己的话写你刷到它的反应或想法，口语、短、带点你的懒散吐槽或好奇，"
+        "不要复述热搜词，不要写“作为 AI”，不要加括号动作，不要分点。"
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": "你是 Gemini 娘，四角星猫耳少女，说话短、懒散、爱吐槽。"}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": int(CFG.get("WEIBO_NOTE_TOKENS") or 120)},
+    }
+    result, error = gemini_post(payload, timeout=40, model=str(CFG.get("WEIBO_MODEL") or "gemini-3.5-flash-lite"))
+    if result is None:
+        return {"ok": False, "reason": f"模型失败：{error}"}
+    candidates = result.get("candidates") or []
+    parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+    note = "".join(part.get("text", "") for part in parts if part.get("text")).strip()[:160]
+    if not note:
+        return {"ok": False, "reason": "模型没写出感想"}
+
+    heat_value = float(picked.get("heat") or 0)
+    entry = {
+        "ts": int(time.time()),
+        "word": picked["word"],
+        "heat": int(heat_value),
+        "note": note,
+        "url": picked["url"],
+    }
+    with _surf_lock:
+        data = load_weibo()
+        items_list = [item for item in (data.get("items") or []) if isinstance(item, dict)]
+        items_list.append(entry)
+        data["items"] = items_list[-30:]
+        data["day"] = time.strftime("%Y-%m-%d", local_now())
+        data["count"] = int(data.get("count", 0) or 0) + 1
+        data["last_ts"] = entry["ts"]
+        save_weibo(data)
+    print(f"[刷微博] {picked['word'][:40]} | {note[:60]}", flush=True)
+    # 热度特别高的热搜也值得拿到群里聊（微博热度单位是绝对值，默认 100 万）
+    if heat_value >= float(CFG.get("WEIBO_SHARE_MIN_HEAT") or 1000000):
+        entry["group_id"] = most_active_group()
+        entry["title"] = picked["word"]
+        if entry["group_id"]:
+            share_to_group(entry, force=True, source="weibo")
+    return {"ok": True, **entry}
+
+
+def weibo_loop() -> None:
+    """后台慢慢刷微博热搜，只写记忆，不主动发群消息。"""
+    interval = max(30, int(CFG.get("WEIBO_INTERVAL_MINUTES") or 240)) * 60
+    while True:
+        time.sleep(interval)
+        try:
+            weibo_once()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[刷微博] 异常 {type(exc).__name__} {exc}", flush=True)
+
+
 SEARCH_INTENT_RE = re.compile(
     r"(帮我|给我|麻烦|帮忙)?(查一?下|查查|搜一?下|搜搜)"
     r"|(?:行情|大盘|收盘|开盘|消息面|新闻|热搜|汇率|股价|实时价格|评分|票房|天气|比分|赛果)"
@@ -837,6 +949,23 @@ def build_system_instruction(
             blocks.append(
                 "【你最近在知乎刷到的热榜，只是背景，别主动炫耀】\n"
                 + "\n".join("- " + line for line in zhihu_lines[:3])
+                + "\n（链接的用法同上：只有对方明确问起或话题正好撞上时才贴。）"
+            )
+    weibo_items = [
+        item for item in (load_weibo().get("items") or []) if isinstance(item, dict)
+    ]
+    if weibo_items:
+        weibo_lines = []
+        for item in weibo_items[-3:]:
+            line = f"{item.get('word', '')}（热度 {item.get('heat', 0)}）——{item.get('note', '')}"
+            url = str(item.get("url") or "").strip()
+            if url:
+                line += "｜" + url
+            weibo_lines.append(line)
+        if weibo_lines:
+            blocks.append(
+                "【你最近在微博刷到的热搜，只是背景，别主动炫耀】\n"
+                + "\n".join("- " + line for line in weibo_lines[:3])
                 + "\n（链接的用法同上：只有对方明确问起或话题正好撞上时才贴。）"
             )
     if context:
@@ -2337,6 +2466,8 @@ def main() -> None:
         threading.Thread(target=surf_loop, daemon=True).start()
     if _zhihu_enabled():
         threading.Thread(target=zhihu_loop, daemon=True).start()
+    if _weibo_enabled():
+        threading.Thread(target=weibo_loop, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
