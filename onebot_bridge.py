@@ -55,6 +55,8 @@ _group_talk_value: dict[str, float] = {}
 _group_summary_counter: dict[str, int] = {}
 _group_slang_counter: dict[str, int] = {}
 _group_last_notice: dict[str, float] = {}
+# 每个群上一次「主动分享 B 站/知乎」的时间，用来让两个来源轮流、别连着发
+_last_share_ts: dict[str, float] = {}
 _group_buffer: dict[str, list[dict]] = {}
 _group_cursor: dict[str, int] = {}
 _group_seq: dict[str, int] = {}
@@ -1367,20 +1369,24 @@ def send_group_parts(group_id: str, parts: list[str], reply_id: str | None = Non
 
 
 def handle_surf_share(payload: dict) -> dict:
-    """核心按群话题刷到视频后，按概率主动分享一条到群里。
+    """核心刷到内容后，按概率主动分享一条到群里。
 
-    保护：群白名单、时段（默认 9-23 点）、发言冷却、群里最近得有人聊、概率控制。
+    保护：群白名单、时段（默认 9-23 点）、发言冷却、群里最近得有人聊、
+    分享间隔（保证 B 站/知乎轮流，不连着刷）、概率控制。
+    force=True 时跳过概率（知乎高热话题用），其余保护照旧。
     """
     group_id = str(payload.get("group_id") or "").strip()
     url = str(payload.get("url") or "").strip()
     note = str(payload.get("note") or "").strip()
     title = str(payload.get("title") or "").strip()
+    source = str(payload.get("source") or "bilibili")[:20]
+    force = bool(payload.get("force"))
     if not group_id or not url.startswith("http"):
         return {"ok": False, "reason": "缺少群号或链接"}
     if group_id not in group_whitelist():
         return {"ok": False, "reason": "群不在白名单"}
     if is_dry():
-        log_line(f"[分享视频][干跑] {group_id} | {title[:40]} | {url}")
+        log_line(f"[分享{source}][干跑] {group_id} | {title[:40]} | {url}")
         return {"ok": False, "reason": "干跑模式不发送"}
     now = time.time()
     hour = int(time.strftime("%H", time.localtime(now)))
@@ -1388,6 +1394,11 @@ def handle_surf_share(payload: dict) -> dict:
     end = _int_cfg("QQ_SURF_SHARE_END", 23, 1, 24)
     if not start <= hour < end:
         return {"ok": False, "reason": "不在分享时段"}
+    # 分享间隔：两个来源共用，避免 B 站和知乎前后脚各发一条
+    gap = _float_cfg("QQ_SURF_SHARE_GAP", 90, 5, 1440) * 60
+    last_share = float(_last_share_ts.get(group_id, 0.0))
+    if now - last_share < gap:
+        return {"ok": False, "reason": "距上次分享还不满间隔"}
     last_reply = float(_group_last_reply.get(group_id, 0.0))
     if now - last_reply < observe_cooldown():
         return {"ok": False, "reason": "刚说过话，冷却中"}
@@ -1398,14 +1409,15 @@ def handle_surf_share(payload: dict) -> dict:
     ]
     if len(recent) < 2:
         return {"ok": False, "reason": "群里太安静"}
-    if random.random() > surf_share_rate():
+    if not force and random.random() > surf_share_rate():
         return {"ok": False, "reason": "这次不分享"}
-    parts = [note[:200] or f"刚刷到个视频，{title[:40]}", url]
+    parts = [note[:200] or f"刚刷到个东西，{title[:40]}", url]
     ok = send_group_parts(group_id, parts, None, None)
     if ok:
+        _last_share_ts[group_id] = now
         _group_last_reply[group_id] = now
         _group_last_bot_text[group_id] = note[:200]
-        log_line(f"[分享视频] {group_id} | {title[:40]} | {url}")
+        log_line(f"[分享{source}] {group_id} | {title[:40]} | {url}")
     return {"ok": ok}
 
 

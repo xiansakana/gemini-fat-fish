@@ -219,6 +219,8 @@ DEFAULTS = {
     "ZHIHU_DAILY_CALLS": "4",
     "ZHIHU_MODEL": "gemini-3.5-flash-lite",
     "ZHIHU_NOTE_TOKENS": "120",
+    # 知乎热度达到多少「万」才值得主动分享
+    "ZHIHU_SHARE_MIN_HEAT": "1000",
     # 群事件（撤回/入群/退群）回应概率与最短间隔
     "QQ_NOTICE_RATE": "0.5",
     "QQ_NOTICE_GAP": "60",
@@ -555,8 +557,26 @@ def surf_once(force: bool = False) -> dict:
     return {"ok": True, **entry}
 
 
-def share_to_group(entry: dict) -> None:
-    """把「按群话题刷到」的视频告诉桥，由桥判断要不要主动发到群里。"""
+def most_active_group() -> str:
+    """最近有动静的群，用于给没有群归属的内容（比如知乎热榜）找分享去处。"""
+    try:
+        paths = sorted(
+            glob.glob(str(SESSIONS_DIR / "group_*.json")),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+    except OSError:
+        return ""
+    if not paths:
+        return ""
+    return os.path.basename(paths[0]).replace("group_", "").replace(".json", "")
+
+
+def share_to_group(entry: dict, force: bool = False, source: str = "bilibili") -> None:
+    """把刷到的内容告诉桥，由桥判断要不要主动发到群里。
+
+    force=True 用于知乎高热话题：跳过概率，但仍受分享间隔、时段、活跃度约束。
+    """
     group_id = str(entry.get("group_id") or "").strip()
     if not group_id:
         return
@@ -567,6 +587,8 @@ def share_to_group(entry: dict) -> None:
             "title": entry.get("title", ""),
             "note": entry.get("note", ""),
             "url": entry.get("url", ""),
+            "force": bool(force),
+            "source": source,
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -617,6 +639,20 @@ def _zhihu_enabled() -> bool:
     return str(CFG.get("ZHIHU_ENABLED", "1")).lower() not in ("0", "false", "no", "off")
 
 
+def _parse_heat(text: str) -> float:
+    """把「1262 万热度」「1.2 亿热度」统一换算成「万」。"""
+    match = re.search(r"([\d.]+)\s*(万|亿)?", str(text or ""))
+    if not match:
+        return 0.0
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return 0.0
+    if match.group(2) == "亿":
+        value *= 10000
+    return value
+
+
 def zhihu_once(force: bool = False) -> dict:
     """刷一条知乎热榜，用 lite 模型写一句感想，存进记忆。"""
     if not force and not _zhihu_enabled():
@@ -661,11 +697,13 @@ def zhihu_once(force: bool = False) -> dict:
     if not note:
         return {"ok": False, "reason": "模型没写出感想"}
 
+    heat_value = _parse_heat(picked.get("heat", ""))
     entry = {
         "ts": int(time.time()),
         "id": picked["id"],
         "title": picked["title"],
         "heat": picked.get("heat", ""),
+        "heat_value": heat_value,
         "note": note,
         "url": picked["url"],
     }
@@ -679,6 +717,11 @@ def zhihu_once(force: bool = False) -> dict:
         data["last_ts"] = entry["ts"]
         save_zhihu(data)
     print(f"[刷知乎] {picked['title'][:40]} | {note[:60]}", flush=True)
+    # 热度特别高的话题，值得主动拿到群里聊（跳过概率，但仍受分享间隔约束）
+    if heat_value >= float(CFG.get("ZHIHU_SHARE_MIN_HEAT") or 1000):
+        entry["group_id"] = most_active_group()
+        if entry["group_id"]:
+            share_to_group(entry, force=True, source="zhihu")
     return {"ok": True, **entry}
 
 
